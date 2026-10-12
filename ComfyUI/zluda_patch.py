@@ -39,9 +39,14 @@ import time
 # 整合包根目录 = 本文件所在的 ComfyUI 文件夹的上一级。
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# HIP SDK root: prefer HIP_PATH, fall back to the default install path of the tested setup.
+# HIP SDK 根目录：优先读 HIP_PATH，取不到时回退到实测环境的默认安装路径。
+HIP_ROOT = os.environ.get("HIP_PATH") or r"C:\Program Files\AMD\ROCm\5.7"
+
 # rocBLAS Tensile kernel directory; it must contain the gfx906 files.
 # rocBLAS Tensile 内核目录，必须包含 gfx906 的文件。
-TENSILE_DIR = r"C:\Program Files\AMD\ROCm\5.7\bin\rocblas\library"
+TENSILE_DIR = os.path.join(HIP_ROOT, "bin", "rocblas", "library")
+
 # Optional custom ZLUDA directory: if you extracted zluda.extpack to a fixed folder, put its path here.
 # 自定义 ZLUDA 目录（可选）：如果你把 zluda.extpack 解压到了固定目录，把路径填进来。
 EXTRA_ZLUDA_DIRS = [os.path.join(ROOT_DIR, "zluda")]
@@ -125,8 +130,7 @@ def preload_zluda():
     # Newest folder first.
     # 最新的文件夹优先。
     candidates.sort(reverse=True)
-    hip_root = os.environ.get("HIP_PATH") or r"C:\Program Files\AMD\ROCm\5.7"
-    hip_bin = os.path.join(hip_root, "bin")
+    hip_bin = os.path.join(HIP_ROOT, "bin")
 
     # Try each candidate until both nvcuda.dll and cublas64_11.dll load.
     # 依次尝试每个候选目录，直到 nvcuda.dll 与 cublas64_11.dll 都加载成功。
@@ -155,8 +159,8 @@ def preload_zluda():
             break
         best = best or (zd, loaded, failed)
 
-    if best is None:
-        return "ZLUDA preload failed"
+    # The candidate list is non-empty here, so the loop above always assigned `best`.
+    # 走到这里候选列表必不为空，因此上面的循环必然已经给 `best` 赋过值。
     zd, loaded, failed = best
     return "zluda_dir=%s | loaded=%d/%d%s" % (
         zd,

@@ -18,7 +18,7 @@
    3. 关闭 cuDNN，
    4. 注意力只保留 math SDP，
    5. 绕开“带 bias 的线性层”所走的 cuBLASLt 融合 GEMM。
-4. **启动器的精度设置保持 FP16 或 Auto 都行。** 精度不是根因，属于可选优化。
+4. **把精度显式钉成 FP16**（启动器四项精度都别留「由 ComfyUI 决定」）：gfx906 上 bf16 只有 fp16 的 1/2~1/3 速度，见[精度与性能](#精度与性能实测)。
 
 ## 实测环境
 
@@ -119,7 +119,7 @@ except Exception as _zluda_e:
 
 **不要使用**的参数：`--use-sage-attention`（包已卸载）、`--use-flash-attention`（未安装）、`--enable-triton-backend`（ZLUDA 下无用）、`--fast` / `--fast cublas_ops`（这条路会直接用 cuBLASLt，必崩）、`--cuda-malloc`。
 
-精度设置（启动器 → 计算精度设置）：`Upcast Attention` 关；Precision / Text Encoder / UNet / VAE 设 **FP16 或 Auto 均可**，根因不是精度。
+精度设置见[精度与性能](#精度与性能实测)：一句话，**全部钉 FP16，不要留「由 ComfyUI 决定」，更不能出现 BF16**。
 
 ### 第 4 步（可选）：用真实模型试跑，以 Anima Base 1.0 为例
 
@@ -141,7 +141,7 @@ except Exception as _zluda_e:
 
 1. **预加载 ZLUDA 的 DLL**（`nvcuda.dll`、`nvml.dll`、`cublas64_11.dll`、`cusparse64_11.dll`、`nvrtc64_112_0.dll`），并把 ZLUDA 目录与 `%HIP_PATH%\bin` 加进 `PATH` / `os.add_dll_directory`。
    _为什么：_ ZLUDA 的 `nvcuda.dll` 必须**先于 torch 的 CUDA 初始化**被加载，否则 torch 会报 `Found no NVIDIA driver on your system`。启动器本来自己在做这件事（每次运行把 DLL 解压到 `%TEMP%\<GUID>`），但它的注入链路在我们的场景下不稳定，所以补丁自己扫描 `%TEMP%`、`%TMP%`、`%LOCALAPPDATA%\Temp`（以及整合包根目录下的 `zluda\`）找到那个目录并预加载。
-2. **设置 `ROCBLAS_TENSILE_LIBPATH`** 为 `C:\Program Files\AMD\ROCm\5.7\bin\rocblas\library`。
+2. **设置 `ROCBLAS_TENSILE_LIBPATH`** 为 `<HIP SDK>\bin\rocblas\library`（补丁优先读环境变量 `HIP_PATH`，取不到时回退到实测环境的 `C:\Program Files\AMD\ROCm\5.7`）。
    _为什么：_ ZLUDA 的 cuBLAS 把矩阵乘转给 **rocBLAS**，rocBLAS 需要**对应架构（gfx906）的 Tensile 内核**。启动器把该变量指向 `%TEMP%` 下某个没有这些内核的目录，结果就是 `rocBLAS error: Cannot read .../TensileLibrary.dat ... for GPU arch : gfx906` 并 `Fatal Python error: Aborted`。
 3. **`torch.backends.cudnn.enabled = False`**
    _为什么：_ ZLUDA 没有 cuDNN；不关就会 `cuDNN error: CUDNN_STATUS_INTERNAL_ERROR`（VAE 的卷积会最先中招）。关闭后卷积走可用的回退路径（已实测）。
@@ -149,6 +149,90 @@ except Exception as _zluda_e:
    _为什么：_ ZLUDA 不支持 flash attention 的内核；绘世启动器自己的 ZLUDA 兼容补丁也是这么做的。
 5. **把“带 bias 的线性层”拆成 `matmul` + 加法**（并对 `torch.addmm` 做同样处理）。
    _为什么：_ PyTorch 对 `F.linear(x, w, b)` / `addmm` 使用**只有 cuBLASLt 实现的 bias 融合 GEMM**（`gemm_and_bias`）。ZLUDA **完全没有 cuBLASLt 实现**（5 个 DLL 里没有任何 `cublasLt*` 导出），于是 torch 会去用 `torch\lib\cublasLt64_11.dll`（NVIDIA 正版，544 MB），必然返回 `CUBLAS_STATUS_NOT_SUPPORTED`。实测：无 bias 的 `mm` / `bmm` / `baddbmm` 全部正常，**只有带 bias 的 linear / addmm 会崩**，与精度（fp16 / bf16 / fp32）无关。
+
+## 精度与性能（实测）
+
+以下数字均为**测试机实测**（MI50 刷 Radeon VII PRO vBIOS / gfx906 / HIP SDK 5.7.1 / torch 2.7.1+cu118 / ZLUDA）。
+
+### 1. 为什么必须钉 FP16，而不是 BF16
+
+ZLUDA 在这台机器上冒充 NVIDIA 显卡，这会让 ComfyUI 里一条**专门为 gfx906 准备的排除规则失效**：
+
+- ZLUDA 下 `torch.version.hip` 是 `None`、`torch.version.cuda` 是 `11.8`，所以 `is_amd()` 返回 False（它要求 `torch.version.hip` 有值）。
+- 于是 `should_use_bf16()` 里「RDNA2 及更老不支持 bf16」那段判断被跳过，而那份架构列表里**明确写着 `gfx906`**。
+- 同时 ZLUDA 上报的计算能力是 **(8, 8)**、`torch.cuda.is_bf16_supported()` 返回 True，于是 `should_use_bf16()` 最终返回 True。
+- 模型如果把 bf16 排在 `supported_inference_dtypes` 第一位（例如 Anima Base 1.0 是 `[bfloat16, float16, float32]`），`unet_dtype()` 的第一轮循环就直接返回 bf16。
+
+| 精度 | 实测 | 相对 fp16 |
+| --- | --- | --- |
+| fp16 | 9.54 TFLOPS | 1.00× |
+| bf16 | 5.26 TFLOPS | 0.55× |
+| fp32 | 9.10 TFLOPS | 0.95× |
+
+（4096×4096 矩阵乘。）
+
+结论：**钉 FP16**。不要选 FP32——速度和 fp16 基本持平，但显存占用翻倍，16 GB 卡上是负收益。
+
+自检：启动日志里应为 `model weight dtype torch.float16, manual cast: None`；出现 `torch.bfloat16` 就说明还在走慢路径。
+
+### 2. 启动器「计算精度设置」怎么设
+
+启动器「高级选项 → 计算精度设置」有四行加一个开关，建议：
+
+| 面板项 | 设为 | 说明 |
+| --- | --- | --- |
+| 通常模型精度 | **FP16** |  |
+| 文本编码器 (Text Encoder) 模型精度 | **FP16** | 默认本来就是 fp16，设成 FP16 属于保险 |
+| U-Net 模型精度 | **FP16** | 直接对应上面那条 bf16 问题 |
+| VAE 模型精度 | **FP16** | 防止 VAE 落到 bf16 |
+| 使用向上采样法提高 XAttn 精度 (upcast-attention) | **保持关** | 开了会把注意力升到 fp32，这卡上更慢 |
+
+⚠️ 一个例外提醒：ComfyUI 对 `--fp16-vae` 自己的说明就写着「might cause black images」。如果 VAE 设成 FP16 后出图发黑，把「VAE 模型精度」改回「由 ComfyUI 决定」。
+
+⚠️ **一个未证实的环节**：启动器文件里能找到它的精度选项名（`launchargs.precision.fp16/bf16/fp32/...`）和「由 ComfyUI 决定」（`launchargs.followcomfyui`），但**找不到** ComfyUI 的原生参数串（`--fp16-unet` 这类），所以面板有没有真的把精度传给 ComfyUI，我们无法从文件上证实。
+
+**验证方法**：把面板设成 FP16 启动一次，看启动器控制台回显的完整命令行里有没有 `--fp16-unet`，再看 ComfyUI 日志的 `model weight dtype` 是不是 `torch.float16`。
+
+**兜底**：如果不确定，直接在「高级选项 → 其他设置 → 自定义参数」里写 ComfyUI 的原生参数 `--fp16-unet`（对应面板的 U-Net 一行）、`--fp16-text-enc`、`--fp16-vae`；这条路已被 `--disable-cuda-malloc` 证明能到 ComfyUI。面板与自定义参数设成同一精度不冲突。
+
+⚠️ **必须避开的坑**：bf16 的检查顺序在 fp16 **之前**。所以只要面板某一项或自定义参数里还留着 BF16，结果就是 bf16，钉的 FP16 会失效。
+
+### 3. 注意力后端：把默认的 SubQuad 换成 Split
+
+没装 xformers / flash / sage 时，不加参数会用 SubQuad，ComfyUI 自己会打印一句提示：
+
+```
+Using sub quadratic optimization for attention, if you have memory or speed issues try using: --use-split-cross-attention
+```
+
+SubQuad 慢的原因：它内部的 `kv_chunk_size` 默认是 `√T`。1024×1024 出图时自注意力是 T=4096，于是它把一次大矩阵乘切成 **64 个小块**，每块都要单独做 baddbmm + softmax；Split 只做一次大 baddbmm。
+
+| 实现 | 耗时 | 相对 |
+| --- | --- | --- |
+| Split 式（1 次大 baddbmm） | 23.34 ms | 1.00× |
+| SubQuad 式（64 个小块） | 63.22 ms | 2.71× |
+
+（batch×heads=16、T=4096、D=128、fp16。这是简化复现；真实实现每块还要做掩码和在线 softmax 重缩放，所以实际差距更大。）
+
+**「默认是 SubQuad」有一个前提**：ZLUDA 下 `is_nvidia()` 返回 True，所以**不加任何注意力参数时** ComfyUI 会自动改用 `attention_pytorch`（PyTorch SDP），并不是 SubQuad；只有启动器显式传了 `--use-quad-cross-attention` 时才会落到 SubQuad。请用日志确认当前是哪一个：
+
+- `Using sub quadratic optimization for attention` → SubQuad（慢）
+- `Using split optimization for attention` → Split
+- `Using pytorch attention` → PyTorch SDP
+
+**建议**：在「高级选项 → 其他设置 → 自定义参数」里加 `--use-split-cross-attention`；如果启动器 Cross Attention 项设成了 SubQuad，请改成 Split 或「由 ComfyUI 决定」。
+
+### 4. 量化模型与精度标志的关系
+
+| 模型类型 | 钉 FP16 的影响 | 说明 |
+| --- | --- | --- |
+| GGUF（Q4 / Q5 / Q8） | **有益无害** | 反量化的计算 dtype 跟随推理 dtype，钉 FP16 就反量化到 fp16，避开 bf16 |
+| fp8 存储的模型 | 会**覆盖** fp8 标志 | `--fp16-unet` 在 `unet_dtype()` 里的检查顺序排在 fp8 之前 |
+| INT8（torchao / bitsandbytes 类） | 一般不受影响 | 核心没有 int8-unet 参数，这类量化由节点自己管 dtype |
+
+- GGUF 的机制：`cast_bias_weight()` 里计算 dtype 取输入激活的 dtype（也就是模型推理 dtype），再交给 `dequantize_tensor()` 反量化；所以钉 FP16 会让量化模型反量化到 fp16 而不是 bf16。权重仍以量化形式保存，不会变糊也不会变慢。
+- 要单独覆盖某个 GGUF 模型，用 `UnetLoaderGGUFAdvanced` 节点的 `dequant_dtype` / `patch_dtype` 下拉（`default / target / float32 / float16 / bfloat16`），不影响全局。
+- fp8 存储的模型属于数值路径变化，建议同一工作流跑两遍对比再定。
 
 ## 验证清单
 
@@ -162,6 +246,17 @@ except Exception as _zluda_e:
 ```
 
 同样的内容也会追加写入整合包根目录下的 `_zluda_status.txt`（以及临时文件夹里的 `zluda_status.txt`）。
+
+如果日志里出现下面这些行，说明补丁没有完全生效（`failed=` 后面最多列 3 个失败项）：
+
+| 日志行 | 含义 | 处理 |
+| --- | --- | --- |
+| `[ZLUDA] Preload: No ZLUDA dir found (nvcuda.dll not preloaded / nvcuda.dll 未预加载)` | 没找到含 ZLUDA DLL 的目录，`nvcuda.dll` 未预加载 | 先让启动器正常跑一次 ComfyUI（它会把 DLL 解到 `%TEMP%\<GUID>`）；或把 `.launcher\zluda.<hash>.extpack` 用 7-Zip 解压到整合包根目录的 `zluda\` |
+| `[ZLUDA] Preload: zluda_dir=... \| loaded=3/5 \| failed=...` | 部分 DLL 加载失败 | 看 `failed=` 列出的项：`xxx.dll:missing` 是文件缺失；`WinError 193` 通常是拿到了占位文件或 HTML，而不是真正的 DLL |
+| `[ZLUDA] Direct import failed: ...` | 补丁在导入 torch 时抛了异常 | 后面应紧跟 `Fallback hook installed`；若没有，说明连回退钩子都没装上 |
+| `[ZLUDA] Fallback hook installed` | 已安装导入钩子，torch 加载完成后会补打补丁 | 下一次 `import torch` 之后应出现 `Late torch=...` |
+| `[ZLUDA] Late torch=...` | 回退路径补打补丁成功 | 确认行内 `cudnn=False \| sdp=math \| linear-patch[F.linear=_linear]` 都在 |
+| `[ZLUDA] Patch FAILED: ...` | `main.py` 顶部的引导代码本身出错 | 检查引导代码是否插在 `main.py` 第一行之前、`zluda_patch.py` 是否在 `ComfyUI\` 下 |
 
 ### 2. 一键自检
 
@@ -190,8 +285,9 @@ linear: <某个数字>
 | ---------------------------------------------------------------------------------- | ------------------------------------------------------- |
 | `pytorch version:`                                                                 | `2.7.1+cu118`                                           |
 | `Total VRAM ...`                                                                   | 测试所用显卡为 `16368 MB`                               |
-| `VAE load device: ... dtype:`                                                      | `torch.float16`（或 bfloat16，取决于精度设置）          |
-| `model weight dtype ...`                                                           | `torch.float16` / `torch.bfloat16`                      |
+| `VAE load device: ... dtype:`                                                      | `torch.float16`          |
+| `model weight dtype ...`                                                           | `torch.float16`（**不是** `bfloat16`） |
+| `Using ... attention`                                                             | `split` 或 `pytorch`，**不要** `sub quadratic`                      |
 | `Unsupported Pytorch detected. DynamicVRAM requires Pytorch version 2.8 or later.` | **正常提示**，ComfyUI 会退回旧版 ModelPatcher，不是错误 |
 
 ## 故障排查
@@ -225,8 +321,8 @@ pip install "https://github.com/woct0rdho/SageAttention/releases/download/v2.2.0
 
 1. **`torch.backends.cuda.preferred_blas_library(...)` 在 Windows 上无效**（torch 自己会警告 `experimental feature. It is not supported on Windows`）。别指望用它来切 BLAS 后端，只能像补丁那样在 Python 层绕。
 2. **不要改名或删除 `torch\lib\cublasLt64_11.dll`。** `torch_cuda.dll` 静态引用了它，改名会让 `import torch` 直接失败（已实测确认）。
-3. **精度设置：** 现在 FP16 / Auto 都能跑。若想用模型原生 bf16，把 UNet Precision 改回 `Auto` 即可。
-4. **性能：** 目前注意力是 math SDP（ZLUDA 的限制），显存与速度都不会最优；可尝试 `--use-split-cross-attention`，或降低分辨率。
+3. **精度设置：** 不要再为了「用模型原生 bf16」把 UNet Precision 改回 `Auto`。这套环境下 bf16 会明显变慢，见[精度与性能](#精度与性能实测)。
+4. **性能：** 注意力后端与精度都会显著影响速度，见[精度与性能](#精度与性能实测)；此外可尝试降低分辨率。
 5. **补丁的扩展方向：** 若以后在别的算子上再遇到 `CUBLAS_STATUS_NOT_SUPPORTED`，可在 `patch_torch()` 里继续绕（例如把 `F.conv2d` 换成 `unfold + matmul` 的等价实现，已实测可用）。
 6. **防止启动器覆盖：** 启动器更新 ComfyUI 会重置 `main.py`，需要重新插入引导代码；`zluda_patch.py` 也可能被清掉，建议留备份。
 7. **诊断资料：** 启动器（疑难解答页面）生成的 `Diagnostics-*.log` 是环境快照加控制台缓冲区，**会包含多次运行的历史输出**。判断某行日志是否来自新进程，要看 `_zluda_status.txt` 的时间戳。
@@ -254,7 +350,7 @@ pip install "https://github.com/woct0rdho/SageAttention/releases/download/v2.2.0
 | `.launcher\tensile-gfx906.<hash>.extpack`                       | gfx906 的 rocBLAS Tensile 内核（备用来源）          |
 | `.launcher\preference.json`                                     | 启动器偏好（含代理地址、自定义参数等）              |
 | `ComfyUI\blueprints\Text to Image (Anima Base 1.0).json`        | Anima 官方模板                                      |
-| `C:\Program Files\AMD\ROCm\5.7\bin\rocblas\library`（绝对路径） | 补丁所指向的 gfx906 Tensile 内核目录                |
+| `%HIP_PATH%\bin\rocblas\library`（绝对路径） | 补丁所指向的 gfx906 Tensile 内核目录（`HIP_PATH` 取不到时回退到 `C:\Program Files\AMD\ROCm\5.7`）                |
 | `%TEMP%\<GUID>\`（绝对路径，每次运行新建）                      | 启动器解压 ZLUDA DLL 的位置，补丁会自动扫描并预加载 |
 
 若更换整合包版本或 HIP SDK 版本，请重新核对[实测环境](#实测环境)中的版本匹配关系。

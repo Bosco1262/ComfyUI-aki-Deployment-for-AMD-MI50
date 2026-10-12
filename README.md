@@ -18,7 +18,7 @@ Four things are needed to run this bundle on ZLUDA:
    3. disables cuDNN,
    4. keeps only the math SDP attention backend,
    5. bypasses the cuBLASLt bias-fused GEMM used by linear layers with a bias.
-4. **Precision settings** in the launcher can stay at FP16 or Auto. Precision is not the root cause; changing it is an optional tweak.
+4. **Pin the precision to FP16 explicitly** (leave none of the launcher's four precision rows at "let ComfyUI decide"): on gfx906 bf16 runs at only 1/2 to 1/3 of fp16 speed. See [Precision and performance](#precision-and-performance-measured).
 
 ## Tested environment
 
@@ -119,7 +119,7 @@ Why: `ComfyUI\cuda_malloc.py` automatically enables `cudaMallocAsync` (`PYTORCH_
 
 **Do not use** these arguments: `--use-sage-attention` (the package is uninstalled), `--use-flash-attention` (not installed), `--enable-triton-backend` (useless under ZLUDA), `--fast` / `--fast cublas_ops` (this path calls cuBLASLt directly and always crashes), `--cuda-malloc`.
 
-Precision (launcher → compute precision settings, 计算精度设置): set `Upcast Attention` to off; set Precision / Text Encoder / UNet / VAE to **FP16 or Auto**. Precision is not the root cause.
+Precision settings are covered in [Precision and performance](#precision-and-performance-measured). In one line: **pin everything to FP16, leave nothing at "let ComfyUI decide", and never let BF16 appear anywhere.**
 
 ### Step 4 (optional): Try a real model, for example Anima Base 1.0
 
@@ -141,7 +141,7 @@ Workflow: use the template bundled with the package, `ComfyUI\blueprints\Text to
 
 1. **Preload the ZLUDA DLLs** (`nvcuda.dll`, `nvml.dll`, `cublas64_11.dll`, `cusparse64_11.dll`, `nvrtc64_112_0.dll`) and add the ZLUDA folder and `%HIP_PATH%\bin` to `PATH` / `os.add_dll_directory`.
    _Why:_ ZLUDA's `nvcuda.dll` must be loaded **before** torch initializes CUDA, otherwise torch reports `Found no NVIDIA driver on your system`. The launcher normally does this itself (it unpacks the DLLs into `%TEMP%\<GUID>` on every run), but its injection was not reliable in this setup. So the patch scans `%TEMP%`, `%TMP%` and `%LOCALAPPDATA%\Temp` for that folder (and `zluda\` in the package root) and preloads from it.
-2. **Set `ROCBLAS_TENSILE_LIBPATH`** to `C:\Program Files\AMD\ROCm\5.7\bin\rocblas\library`.
+2. **Set `ROCBLAS_TENSILE_LIBPATH`** to `<HIP SDK>\bin\rocblas\library` (the patch reads the `HIP_PATH` environment variable and falls back to `C:\Program Files\AMD\ROCm\5.7` from the tested setup).
    _Why:_ ZLUDA's cuBLAS forwards matrix multiplications to **rocBLAS**, which needs the Tensile kernels of the **matching architecture (gfx906)**. The launcher points this variable at a folder under `%TEMP%` that does not contain them, which ends in `rocBLAS error: Cannot read .../TensileLibrary.dat ... for GPU arch : gfx906` and `Fatal Python error: Aborted`.
 3. **`torch.backends.cudnn.enabled = False`**
    _Why:_ ZLUDA has no cuDNN. Left enabled it fails with `cuDNN error: CUDNN_STATUS_INTERNAL_ERROR` (the VAE's convolutions are hit first). With cuDNN off, convolutions use a fallback path that works (verified).
@@ -149,6 +149,90 @@ Workflow: use the template bundled with the package, `ComfyUI\blueprints\Text to
    _Why:_ ZLUDA cannot run the flash attention kernels; the launcher's own ZLUDA compatibility patch does the same.
 5. **Split "linear layer with bias" into `matmul` + add** (and do the same for `torch.addmm`).
    _Why:_ PyTorch runs `F.linear(x, w, b)` / `addmm` through a **bias-fused GEMM that only exists in cuBLASLt** (`gemm_and_bias`). ZLUDA has **no cuBLASLt implementation at all** (none of its 5 DLLs exports a `cublasLt*` symbol), so torch falls back to NVIDIA's genuine `torch\lib\cublasLt64_11.dll` (544 MB), which necessarily returns `CUBLAS_STATUS_NOT_SUPPORTED`. Measured: `mm` / `bmm` / `baddbmm` without bias all work; **only linear / addmm with a bias crash**, regardless of precision (fp16 / bf16 / fp32).
+
+## Precision and performance (measured)
+
+All numbers below are **measured on the test machine** (MI50 flashed with the Radeon VII PRO vBIOS / gfx906 / HIP SDK 5.7.1 / torch 2.7.1+cu118 / ZLUDA).
+
+### 1. Why FP16 must be pinned, not BF16
+
+ZLUDA impersonates an NVIDIA card on this machine, which defeats a rule in ComfyUI that exists **specifically for gfx906**:
+
+- Under ZLUDA `torch.version.hip` is `None` and `torch.version.cuda` is `11.8`, so `is_amd()` returns False (it requires `torch.version.hip`).
+- Therefore the "RDNA2 and older don't support bf16" branch in `should_use_bf16()` is skipped, even though that architecture list **explicitly contains `gfx906`**.
+- At the same time ZLUDA reports compute capability **(8, 8)** and `torch.cuda.is_bf16_supported()` returns True, so `should_use_bf16()` ends up returning True.
+- If a model lists bf16 first in `supported_inference_dtypes` (Anima Base 1.0 is `[bfloat16, float16, float32]`), the first iteration of `unet_dtype()`'s loop returns bf16 directly.
+
+| Precision | Measured | Relative to fp16 |
+| --- | --- | --- |
+| fp16 | 9.54 TFLOPS | 1.00× |
+| bf16 | 5.26 TFLOPS | 0.55× |
+| fp32 | 9.10 TFLOPS | 0.95× |
+
+(4096×4096 matrix multiplication.)
+
+Conclusion: **pin FP16**. Do not choose FP32: it is about as fast as fp16 but doubles the memory footprint, which is a net loss on a 16 GB card.
+
+Self-check: the startup log should show `model weight dtype torch.float16, manual cast: None`; `torch.bfloat16` means the slow path is still active.
+
+### 2. How to set the launcher's "compute precision settings"
+
+The launcher's **Advanced options → compute precision settings** has four rows plus one toggle:
+
+| Row | Set to | Notes |
+| --- | --- | --- |
+| General model precision | **FP16** |  |
+| Text encoder model precision | **FP16** | The default is already fp16; setting FP16 is just insurance |
+| U-Net model precision | **FP16** | Directly addresses the bf16 issue above |
+| VAE model precision | **FP16** | Prevents the VAE from falling back to bf16 |
+| Upcast XAttn precision (upcast-attention) | **Leave off** | Enabling it upcasts attention to fp32, which is slower on this card |
+
+⚠️ One exception to keep in mind: ComfyUI's own description of `--fp16-vae` says it "might cause black images". If images come out black with the VAE set to FP16, set "VAE model precision" back to "let ComfyUI decide".
+
+⚠️ **One unverified link**: the launcher binaries contain its precision option names (`launchargs.precision.fp16/bf16/fp32/...`) and "let ComfyUI decide" (`launchargs.followcomfyui`), but **no ComfyUI-native flag strings** (such as `--fp16-unet`), so whether the panel actually forwards the precision to ComfyUI cannot be confirmed from the files.
+
+**How to verify**: set the panel to FP16 and start once; check whether the command line echoed in the launcher console contains `--fp16-unet`, and whether the ComfyUI log shows `model weight dtype` as `torch.float16`.
+
+**Fallback**: if unsure, write ComfyUI's native flags in **Advanced options → Other settings → Custom arguments**: `--fp16-unet` (the U-Net row), `--fp16-text-enc`, `--fp16-vae`. That path is already proven to reach ComfyUI by `--disable-cuda-malloc`. Setting the panel and the custom arguments to the same precision does not conflict.
+
+⚠️ **A pitfall to avoid**: bf16 is checked **before** fp16. So if any panel row or custom argument still sets BF16, the result is bf16 and the pinned FP16 has no effect.
+
+### 3. Attention backend: replace the default SubQuad with Split
+
+With no xformers / flash / sage installed, SubQuad is used without arguments, and ComfyUI prints a hint itself:
+
+```
+Using sub quadratic optimization for attention, if you have memory or speed issues try using: --use-split-cross-attention
+```
+
+Why SubQuad is slow: its internal `kv_chunk_size` defaults to `√T`. For a 1024×1024 image the self-attention is T=4096, so it splits one large matrix multiplication into **64 small chunks**, each doing its own baddbmm + softmax; Split does a single large baddbmm.
+
+| Implementation | Time | Relative |
+| --- | --- | --- |
+| Split-like (one large baddbmm) | 23.34 ms | 1.00× |
+| SubQuad-like (64 chunks) | 63.22 ms | 2.71× |
+
+(batch×heads=16, T=4096, D=128, fp16. This is a simplified reproduction; the real implementation also does masking and online softmax rescaling per chunk, so the real gap is larger.)
+
+**"The default is SubQuad" comes with a condition**: under ZLUDA `is_nvidia()` returns True, so with **no attention arguments at all** ComfyUI switches to `attention_pytorch` (PyTorch SDP), not SubQuad; SubQuad is only reached when the launcher explicitly passes `--use-quad-cross-attention`. Check the log for which one is active:
+
+- `Using sub quadratic optimization for attention` → SubQuad (slow)
+- `Using split optimization for attention` → Split
+- `Using pytorch attention` → PyTorch SDP
+
+**Recommendation**: add `--use-split-cross-attention` to **Advanced options → Other settings → Custom arguments**. If the launcher's Cross Attention row is set to SubQuad, change it to Split or "let ComfyUI decide".
+
+### 4. Quantized models and precision flags
+
+| Model type | Effect of pinning FP16 | Notes |
+| --- | --- | --- |
+| GGUF (Q4 / Q5 / Q8) | **Beneficial, no downside** | The dequantization compute dtype follows the inference dtype, so pinning FP16 dequantizes to fp16 and avoids bf16 |
+| fp8-stored models | **Overrides** the fp8 flags | `--fp16-unet` is checked before fp8 in `unet_dtype()` |
+| INT8 (torchao / bitsandbytes style) | Generally unaffected | Core has no int8-unet flag; such quantization manages its own dtype |
+
+- GGUF mechanism: in `cast_bias_weight()` the compute dtype follows the input activation dtype (i.e. the model inference dtype), which is then handed to `dequantize_tensor()`. So pinning FP16 makes quantized models dequantize to fp16 instead of bf16. The weights stay quantized in storage, so nothing becomes blurry or slower.
+- To override a single GGUF model, use the `dequant_dtype` / `patch_dtype` dropdowns of the `UnetLoaderGGUFAdvanced` node (`default / target / float32 / float16 / bfloat16`); this does not affect the global setting.
+- fp8-stored models change the numeric path, so run the same workflow twice and compare before deciding.
 
 ## Verification
 
@@ -162,6 +246,17 @@ These lines should appear (`<TEMP>` is your temp folder, usually `%LOCALAPPDATA%
 ```
 
 The same lines are appended to `_zluda_status.txt` in the package root (and to `zluda_status.txt` in the temp folder).
+
+If any of the lines below appear, the patch is not fully active (`failed=` lists at most 3 entries):
+
+| Log line | Meaning | Fix |
+| --- | --- | --- |
+| `[ZLUDA] Preload: No ZLUDA dir found (nvcuda.dll not preloaded / nvcuda.dll 未预加载)` | No folder with the ZLUDA DLLs was found, so `nvcuda.dll` was not preloaded | Let the launcher run ComfyUI once (it unpacks the DLLs into `%TEMP%\<GUID>`), or unpack `.launcher\zluda.<hash>.extpack` into `zluda\` in the package root with 7-Zip |
+| `[ZLUDA] Preload: zluda_dir=... \| loaded=3/5 \| failed=...` | Some DLLs failed to load | Look at what `failed=` lists: `xxx.dll:missing` means the file is absent; `WinError 193` usually means a placeholder or HTML file instead of a real DLL |
+| `[ZLUDA] Direct import failed: ...` | The patch raised while importing torch | `Fallback hook installed` should follow; if it does not, even the fallback hook failed to install |
+| `[ZLUDA] Fallback hook installed` | The import hook is installed and will patch torch once it loads | `Late torch=...` should appear after the next `import torch` |
+| `[ZLUDA] Late torch=...` | The fallback path patched torch successfully | Confirm the line contains `cudnn=False \| sdp=math \| linear-patch[F.linear=_linear]` |
+| `[ZLUDA] Patch FAILED: ...` | The bootstrap block at the top of `main.py` itself raised | Check that the block sits before the first line of `main.py` and that `zluda_patch.py` is inside `ComfyUI\` |
 
 ### 2. One-shot self-check (does not start the UI)
 
@@ -190,8 +285,9 @@ The check needs a ZLUDA folder it can find: a `<GUID>` folder that a previous la
 | ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
 | `pytorch version:`                                                                 | `2.7.1+cu118`                                                                          |
 | `Total VRAM ...`                                                                   | `16368 MB` on the tested card                                                          |
-| `VAE load device: ... dtype:`                                                      | `torch.float16` (or bfloat16, depending on the precision settings)                     |
-| `model weight dtype ...`                                                           | `torch.float16` / `torch.bfloat16`                                                     |
+| `VAE load device: ... dtype:`                                                      | `torch.float16`                     |
+| `model weight dtype ...`                                                           | `torch.float16` (**not** `bfloat16`) |
+| `Using ... attention`                                                             | `split` or `pytorch`, **not** `sub quadratic`                                                     |
 | `Unsupported Pytorch detected. DynamicVRAM requires Pytorch version 2.8 or later.` | **Normal notice**: ComfyUI falls back to the legacy ModelPatcher; this is not an error |
 
 ## Troubleshooting
@@ -225,8 +321,8 @@ After reverting, ZLUDA can no longer be used, and `main.py` should no longer cal
 
 1. **`torch.backends.cuda.preferred_blas_library(...)` has no effect on Windows** (torch itself warns `experimental feature. It is not supported on Windows`). Do not expect to switch the BLAS backend that way; the only option is to work around it at the Python level, as the patch does.
 2. **Do not rename or delete `torch\lib\cublasLt64_11.dll`.** `torch_cuda.dll` references it statically, so renaming it makes `import torch` fail (confirmed by testing).
-3. **Precision:** FP16 and Auto both work. To use a model's native bf16, set the UNet precision back to `Auto`.
-4. **Performance:** attention currently runs as math SDP (a ZLUDA limitation), so neither VRAM use nor speed is optimal. You can try `--use-split-cross-attention` or a lower resolution.
+3. **Precision:** do not set UNet Precision back to `Auto` in order to use a model's native bf16. Under this setup bf16 is markedly slower; see [Precision and performance](#precision-and-performance-measured).
+4. **Performance:** both the attention backend and the precision have a large effect on speed; see [Precision and performance](#precision-and-performance-measured). Lowering the resolution also helps.
 5. **Extending the patch:** if another operator fails with `CUBLAS_STATUS_NOT_SUPPORTED`, add a workaround in `patch_torch()` (for example replace `F.conv2d` with an equivalent `unfold + matmul`, which was tested to work).
 6. **Launcher overwrites:** a launcher update of ComfyUI resets `main.py`, so re-insert the bootstrap block; `zluda_patch.py` may be wiped as well, so keep a backup.
 7. **Diagnostics:** the launcher's `Diagnostics-*.log` (from its troubleshooting page, 疑难解答) is an environment snapshot plus the console buffer, and **contains the output of several runs**. To tell whether a log line comes from a new process, check the timestamps in `_zluda_status.txt`.
@@ -254,7 +350,7 @@ Files involved in a deployed package (relative to the package root unless noted)
 | `.launcher\tensile-gfx906.<hash>.extpack`                      | rocBLAS Tensile kernels for gfx906 (alternative source)                           |
 | `.launcher\preference.json`                                    | Launcher preferences (including proxy address and custom arguments)               |
 | `ComfyUI\blueprints\Text to Image (Anima Base 1.0).json`       | Official Anima template                                                           |
-| `C:\Program Files\AMD\ROCm\5.7\bin\rocblas\library` (absolute) | gfx906 Tensile kernel directory that the patch points to                          |
+| `%HIP_PATH%\bin\rocblas\library` (absolute) | gfx906 Tensile kernel directory that the patch points to (falls back to `C:\Program Files\AMD\ROCm\5.7` when `HIP_PATH` is unset)                          |
 | `%TEMP%\<GUID>\` (absolute, new on every run)                  | Where the launcher unpacks the ZLUDA DLLs; the patch scans and preloads from here |
 
 If you use a different bundle version or HIP SDK version, re-check the version matching described in [Tested environment](#tested-environment).
