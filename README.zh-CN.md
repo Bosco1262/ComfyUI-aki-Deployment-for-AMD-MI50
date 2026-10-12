@@ -285,10 +285,12 @@ linear: <某个数字>
 | ---------------------------------------------------------------------------------- | ------------------------------------------------------- |
 | `pytorch version:`                                                                 | `2.7.1+cu118`                                           |
 | `Total VRAM ...`                                                                   | 测试所用显卡为 `16368 MB`                               |
-| `VAE load device: ... dtype:`                                                      | `torch.float16`          |
+| `VAE load device: ..., offload device: ..., dtype:`                                 | `cuda:0` / `cpu` / `torch.float16`          |
 | `model weight dtype ...`                                                           | `torch.float16`（**不是** `bfloat16`） |
 | `Using ... attention`                                                             | `split` 或 `pytorch`，**不要** `sub quadratic`                      |
-| `Unsupported Pytorch detected. DynamicVRAM requires Pytorch version 2.8 or later.` | **正常提示**，ComfyUI 会退回旧版 ModelPatcher，不是错误 |
+| `Unsupported Pytorch detected. DynamicVRAM support requires Pytorch version 2.8 or later.` | **正常提示**，ComfyUI 会退回旧版 ModelPatcher，不是错误 |
+
+> 读 `VAE load device` 这行时只看**第一个字段**：它是 VAE 的运行设备，出现 `cpu` 才代表「使用 CPU 运行 VAE」被打开；`offload device: cpu` 是默认的备用位置（只有加 `--gpu-only` 才会变成 `cuda:0`），与 CPU VAE 无关。
 
 ## 故障排查
 

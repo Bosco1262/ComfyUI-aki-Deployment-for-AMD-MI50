@@ -285,10 +285,12 @@ The check needs a ZLUDA folder it can find: a `<GUID>` folder that a previous la
 | ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
 | `pytorch version:`                                                                 | `2.7.1+cu118`                                                                          |
 | `Total VRAM ...`                                                                   | `16368 MB` on the tested card                                                          |
-| `VAE load device: ... dtype:`                                                      | `torch.float16`                     |
+| `VAE load device: ..., offload device: ..., dtype:`                                 | `cuda:0` / `cpu` / `torch.float16`                     |
 | `model weight dtype ...`                                                           | `torch.float16` (**not** `bfloat16`) |
 | `Using ... attention`                                                             | `split` or `pytorch`, **not** `sub quadratic`                                                     |
-| `Unsupported Pytorch detected. DynamicVRAM requires Pytorch version 2.8 or later.` | **Normal notice**: ComfyUI falls back to the legacy ModelPatcher; this is not an error |
+| `Unsupported Pytorch detected. DynamicVRAM support requires Pytorch version 2.8 or later.` | **Normal notice**: ComfyUI falls back to the legacy ModelPatcher; this is not an error |
+
+> When reading the `VAE load device` line, look at the **first field** only: it is the run device of the VAE, and `cpu` there means "run the VAE on the CPU" is enabled. `offload device: cpu` is the default standby location (it only becomes `cuda:0` with `--gpu-only`) and is unrelated to CPU VAE.
 
 ## Troubleshooting
 
