@@ -7,10 +7,11 @@ One file, standard library only. Import it before ComfyUI imports torch:
 
 Contract
   switches      ZLUDA_* environment variables, defaults in PART 0.
-  status lines  ASCII English, "[ZLUDA] " on stderr, mirrored to the status
-                files. A line a human must act on is followed by its own
-                "说明: " line.
-  failure token "FAILED", grep the status file for it.
+  status lines  ASCII English, "[ZLUDA] [LEVEL] event key=value" on stderr,
+                mirrored to the status files. Levels are INFO, OK, WARN, FAILED.
+                A human-actionable line is followed by "hint: " English and
+                "说明: " Chinese.
+  failure token "[FAILED]", search the status file for it.
   uninstall     delete this file and the import line in main.py.
 
 Layout
@@ -21,7 +22,7 @@ Layout
 
 Units
   PRELOAD, TORCH, SDPA, LINEAR, CLI_ARGS, MODEL_MANAGEMENT, ONNX,
-  SUPPORTED_MODELS, OPS, MODEL_DETECTION
+  SUPPORTED_MODELS, OPS, MODEL_DETECTION, GGUF_COMPAT
 
 
 ZLUDA 兼容补丁（MI50 / gfx906 + ZLUDA + ComfyUI）。
@@ -32,9 +33,10 @@ ZLUDA 兼容补丁（MI50 / gfx906 + ZLUDA + ComfyUI）。
 
 契约
   开关      ZLUDA_* 环境变量，默认值在 PART 0。
-  状态行    纯 ASCII 英文，走 stderr 并带 "[ZLUDA] " 前缀，同时镜像到状态
-            文件。需要人处理的行，下面单独跟一行 "说明: "。
-  失败标记  "FAILED"，在状态文件里 grep 它。
+  状态行    纯 ASCII 英文，格式为 "[ZLUDA] [级别] 事件名 key=value"，同时镜像
+            到状态文件。级别为 INFO、OK、WARN、FAILED。需要人处理的行依次跟
+            "hint: " 英文和 "说明: " 中文。
+  失败标记  "[FAILED]"，在状态文件里搜索它。
   卸载      删掉本文件，以及 main.py 里的那行 import。
 
 布局
@@ -45,13 +47,14 @@ ZLUDA 兼容补丁（MI50 / gfx906 + ZLUDA + ComfyUI）。
 
 单元
   PRELOAD、TORCH、SDPA、LINEAR、CLI_ARGS、MODEL_MANAGEMENT、ONNX、
-  SUPPORTED_MODELS、OPS、MODEL_DETECTION
+  SUPPORTED_MODELS、OPS、MODEL_DETECTION、GGUF_COMPAT
 """
 
 import ctypes
 import glob
 import importlib.abc
 import importlib.util
+import inspect
 import os
 import sys
 import tempfile
@@ -82,6 +85,12 @@ TENSILE_DIR = os.path.join(HIP_ROOT, "bin", "rocblas", "library")
 # 可选的自定义 ZLUDA 目录，用于手工解压 extpack 的情况。
 EXTRA_ZLUDA_DIRS = [os.path.join(ROOT_DIR, "zluda")]
 
+# Selected by preload_zluda(); diagnostics use this public value instead of
+# depending on private implementation details.
+#
+# 由 preload_zluda() 设置；诊断工具读取这个公开值，不再依赖私有实现细节。
+ZLUDA_DIR = None
+
 # DLLs in load order: nvcuda first, then the libraries torch will ask for.
 # 按加载顺序排列的 DLL：nvcuda 在前，然后是 torch 会用的库。
 ZLUDA_DLLS = (
@@ -104,11 +113,10 @@ REPORTS = [
 # SWITCHES — 唯一顺序，环境变量优先
 # --------------------------------------------------------------------------------------------------
 # Every switch is read once at import. The order below is also the order of the
-# "switches:" status line, so the log and the source can be compared line by
-# line.
+# "[INFO] switches" fields, so the log and the source can be compared directly.
 #
-# 每个开关只在导入时读一次。下面的顺序就是 "switches:" 状态行的顺序，日志和
-# 源码可以逐行对照。
+# 每个开关只在导入时读一次。下面的顺序就是 "[INFO] switches" 字段的顺序，日志和
+# 源码可以直接对照。
 
 
 # Read a boolean switch: unset falls back to the default; "0", "false",
@@ -201,6 +209,13 @@ ZLUDA_NO_ARG_OVERRIDES = _env_bool("ZLUDA_NO_ARG_OVERRIDES")
 # 不动 ONNX Runtime 的 provider 列表。
 ZLUDA_KEEP_ONNX_CUDA = _env_bool("ZLUDA_KEEP_ONNX_CUDA")
 
+# Add the new ModelPatcher arguments to an old official GGUF node at runtime.
+# The third-party file itself stays untouched, so it can be updated normally.
+#
+# 在运行时给旧版官方 GGUF 节点补上新 ModelPatcher 参数。第三方文件本身不改，
+# 因此可以正常更新。
+ZLUDA_GGUF_COMPAT = _env_bool("ZLUDA_GGUF_COMPAT", True)
+
 # Cache dequantized INT8 weights; keeps the INT8 weights and adds a full fp16
 # copy, about 1.5x the fp16 model (3x the INT8 weights).
 #
@@ -245,9 +260,9 @@ def _write_stream(stream, text):
         pass
 
 
-# Print to stderr and append to every status file; write failures are ignored.
-# 输出到 stderr 并追加写入所有状态文件；写入失败会被有意忽略。
-def _report(text):
+# Print one raw line to stderr and append it to every status file.
+# 输出一行原始文本到 stderr，并追加写入所有状态文件。
+def _emit(text):
     line = "%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text)
     _write_stream(sys.stderr, "[ZLUDA] " + text + "\n")
     for path in REPORTS:
@@ -258,10 +273,37 @@ def _report(text):
             pass
 
 
-# Chinese follow-up line for a message a human must act on.
-# 需要人处理时另起一行的中文提示。
-def _hint(zh):
-    _report("说明: " + zh)
+# Quote a value when it contains whitespace, so one log line stays parseable.
+# 值含空白时加引号，保证一行日志仍可解析。
+def _v(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    text = str(value)
+    if not text or any(char.isspace() for char in text):
+        return '"' + text.replace('"', '\\"') + '"'
+    return text
+
+
+# Format key=value fields in a stable order.
+# 按固定顺序格式化 key=value 字段。
+def _kv(pairs):
+    return " ".join("%s=%s" % (key, _v(value)) for key, value in pairs)
+
+
+# Emit a structured status line: [LEVEL] event key=value ...
+# 输出结构化状态行：[级别] 事件名 key=value ...
+def _log(level, event, detail=""):
+    text = "[%s] %s" % (level, event)
+    if detail:
+        text += " " + detail
+    _emit(text)
+
+
+# Bilingual follow-up lines for a message a human must act on.
+# 需要人处理时另起两行的中英文提示。
+def _hint(hint):
+    _emit("hint: " + hint.english)
+    _emit("说明: " + hint.chinese)
 
 
 _WARNED = set()
@@ -269,23 +311,29 @@ _WARNED = set()
 
 # Report a runtime event once per process; later calls are silent.
 # 运行时事件每个进程只报一次，后续调用静默。
-def _report_once(key, text, hint=""):
+def _report_once(key, level, event, detail="", hint=None):
     if key in _WARNED:
         return
     _WARNED.add(key)
-    _report(text)
+    _log(level, event, detail)
     if hint:
         _hint(hint)
 
 
-# What a unit reports: a status fragment plus an optional Chinese hint. An
+# What a unit reports: a status fragment plus an optional bilingual hint. An
 # empty status keeps the unit out of the log.
 #
-# 补丁单元返回什么：一个状态片段，外加可选的中文提示。状态为空时该单元不写
+# 补丁单元返回什么：一个状态片段，外加可选的双语提示。状态为空时该单元不写
 # 日志。
+class Hint(NamedTuple):
+    english: str
+    chinese: str
+
+
 class Outcome(NamedTuple):
     status: str
-    hint: str = ""
+    hint: Optional[Hint] = None
+    level: str = "OK"
 
 
 # A module hook plus the metadata the framework needs to report it.
@@ -295,7 +343,7 @@ class ModulePatch:
     key: str
     module: str
     apply: Callable[[ModuleType], Outcome]
-    failure_zh: str
+    failure: Hint
 
 
 # One import hook: run `before` before the module body and `after` after it.
@@ -367,14 +415,14 @@ class _HookFinder(importlib.abc.MetaPathFinder):
 # Cause     torch binds CUDA at import time; without the DLLs it reports
 #           "no NVIDIA driver found" and never sees the GPU.
 # Measured  n/a.
-# Failure   Preload: ... | failed=... plus a Chinese hint.
+# Failure   [FAILED] preload ... failed=... plus English and Chinese hints.
 # Switch    none.
 #
 # 作用  设置 ROCBLAS_TENSILE_LIBPATH，并在 torch 之前加载 ZLUDA 的 DLL。
 # 原因  torch 在导入时就绑定 CUDA；没有这些 DLL 会报
 #       "no NVIDIA driver found"，完全看不到显卡。
 # 实测  不适用。
-# 失败  Preload: ... | failed=...，并跟一行中文提示。
+# 失败  [FAILED] preload ... failed=...，并跟一行英文和一行中文提示。
 # 开关  无。
 
 
@@ -437,10 +485,19 @@ def preload_zluda():
 
     if not candidates:
         return Outcome(
-            "No ZLUDA dir found (nvcuda.dll not preloaded)",
-            "没找到含 ZLUDA DLL 的目录，nvcuda.dll 未预加载。先让启动器正常跑一次 "
-            "ComfyUI（它会把 DLL 解到 %TEMP%\\<GUID>），或把 "
-            ".launcher\\zluda.<hash>.extpack 用 7-Zip 解压到整合包根目录的 zluda\\",
+            "status=missing",
+            Hint(
+                "No directory containing ZLUDA DLLs was found, so nvcuda.dll "
+                "was not preloaded. Run ComfyUI once through the launcher (it "
+                "extracts the DLLs to %TEMP%\\<GUID>), or extract "
+                ".launcher\\zluda.<hash>.extpack into the package-root zluda\\ "
+                "folder with 7-Zip.",
+                "没找到含 ZLUDA DLL 的目录，nvcuda.dll 未预加载。先让启动器正常跑"
+                "一次 ComfyUI（它会把 DLL 解到 %TEMP%\\<GUID>），或把 "
+                ".launcher\\zluda.<hash>.extpack 用 7-Zip 解压到整合包根目录的 "
+                "zluda\\",
+            ),
+            "FAILED",
         )
 
     # Newest folder first.
@@ -448,8 +505,12 @@ def preload_zluda():
     candidates.sort(reverse=True)
     hip_bin = os.path.join(HIP_ROOT, "bin")
 
-    # Try each candidate until both nvcuda.dll and cublas64_11.dll load.
-    # 依次尝试每个候选目录，直到 nvcuda.dll 与 cublas64_11.dll 都加载成功。
+    # Prefer the newest complete directory. A partial newest extraction must not
+    # hide an older complete one; if none is complete, keep the attempt that
+    # loaded the most DLLs so the resulting error is as useful as possible.
+    #
+    # 优先使用最新的完整目录。最新的解压目录不完整时，不能让它遮住较旧的完整
+    # 目录；如果都不完整，就保留加载成功数量最多的一次，让错误信息尽量有用。
     best = None
     for _, folder in candidates:
         search = [p for p in (folder, hip_bin) if p and os.path.isdir(p)]
@@ -471,25 +532,35 @@ def preload_zluda():
                 failed.append("%s:%s" % (name, exc))
             else:
                 loaded.append(name)
-        if "nvcuda.dll" in loaded and "cublas64_11.dll" in loaded:
+        if best is None or len(loaded) > len(best[1]):
+            best = (folder, loaded, failed)
+        if not failed:
             best = (folder, loaded, failed)
             break
-        best = best or (folder, loaded, failed)
 
     # The candidate list is non-empty here, so the loop always assigned `best`.
     # 走到这里候选列表必不为空，因此上面的循环必然已经给 `best` 赋过值。
     folder, loaded, failed = best
-    status = "zluda_dir=%s | loaded=%d/%d%s" % (
-        folder,
-        len(loaded),
-        len(ZLUDA_DLLS),
-        (" | failed=" + ";".join(failed[:3])) if failed else "",
-    )
+    global ZLUDA_DIR
+    ZLUDA_DIR = folder
+    fields = [
+        ("dir", folder),
+        ("dlls", "%d/%d" % (len(loaded), len(ZLUDA_DLLS))),
+    ]
+    if failed:
+        fields.append(("failed", ";".join(failed[:3])))
+    status = _kv(fields)
     if failed:
         return Outcome(
             status,
-            "部分 DLL 加载失败：failed= 里的 xxx.dll:missing 是文件缺失；"
-            "WinError 193 通常是拿到了占位文件或 HTML，而不是真正的 DLL。",
+            Hint(
+                "Some DLLs failed to load: xxx.dll:missing in failed= means the "
+                "file is absent; WinError 193 usually means a placeholder or HTML "
+                "file was supplied instead of a real DLL.",
+                "部分 DLL 加载失败：failed= 里的 xxx.dll:missing 是文件缺失；"
+                "WinError 193 通常是拿到了占位文件或 HTML，而不是真正的 DLL。",
+            ),
+            "FAILED",
         )
     return Outcome(status)
 
@@ -502,24 +573,32 @@ def preload_zluda():
 # Cause     ZLUDA has no cuDNN and no flash kernels; the default flags route
 #           attention into kernels that do not exist.
 # Measured  n/a; both failures are immediate.
-# Failure   cudnn FAILED / sdp FAILED.
+# Failure   [FAILED] torch ... cudnn=... sdp=...
 # Switch    none.
 #
 # 作用  关闭 cuDNN，只留下 math SDP 后端。
 # 原因  ZLUDA 没有 cuDNN，也没有 flash 内核；默认开关会把注意力送进不存在的
 #       内核。
 # 实测  不适用；两种失败都是立刻发生的。
-# 失败  cudnn FAILED / sdp FAILED。
+# 失败  [FAILED] torch ... cudnn=... sdp=...
 # 开关  无。
-_HINT_CUDNN = "cuDNN 关闭失败：注意力会报 CUDNN_STATUS_INTERNAL_ERROR，出图会失败或全黑。"
-_HINT_SDP = "SDPA 后端开关没设上：注意力可能走到 ZLUDA 上不存在的 FLASH / cuDNN。"
+_HINT_CUDNN = Hint(
+    "The cuDNN backend could not be disabled: attention reports "
+    "CUDNN_STATUS_INTERNAL_ERROR, so generation fails or produces a black image.",
+    "cuDNN 关闭失败：注意力会报 CUDNN_STATUS_INTERNAL_ERROR，出图会失败或全黑。",
+)
+_HINT_SDP = Hint(
+    "The SDPA backend flags were not applied: attention may select FLASH / cuDNN "
+    "backends that do not exist under ZLUDA.",
+    "SDPA 后端开关没设上：注意力可能走到 ZLUDA 上不存在的 FLASH / cuDNN。",
+)
 
 
 # Disable cuDNN; ZLUDA cannot use it.
 # 关闭 cuDNN；ZLUDA 用不了它。
 def _patch_cudnn(torch_module):
     torch_module.backends.cudnn.enabled = False
-    return Outcome("cudnn=%s" % torch_module.backends.cudnn.enabled)
+    return Outcome("cudnn=" + _v(torch_module.backends.cudnn.enabled))
 
 
 # Keep only the math SDP backend.
@@ -527,6 +606,10 @@ def _patch_cudnn(torch_module):
 def _patch_sdp(torch_module):
     torch_module.backends.cuda.enable_flash_sdp(False)
     torch_module.backends.cuda.enable_mem_efficient_sdp(False)
+    # cuDNN SDP is a separate switch on supported torch versions.
+    # 支持的 torch 版本上，cuDNN SDP 有独立开关。
+    if hasattr(torch_module.backends.cuda, "enable_cudnn_sdp"):
+        torch_module.backends.cuda.enable_cudnn_sdp(False)
     torch_module.backends.cuda.enable_math_sdp(True)
     return Outcome("sdp=math")
 
@@ -540,7 +623,7 @@ def _patch_sdp(torch_module):
 #           enable_flash_sdp(False) flags and puts FLASH / cuDNN first.
 # Measured  gfx906, 1x16x512x128 fp16: bare F.sdpa OK, comfy.ops FAIL,
 #           math only OK; without the raise it returns NaN, a black image.
-# Failure   sdpa=missing / sdpa FAILED / comfy_ops: FAILED ...
+# Failure   [FAILED] torch sdpa=missing / [FAILED] comfy_ops ...
 # Switch    none.
 #
 # 作用  把 F.sdpa 与 comfy.ops.sdpa 都包成 math-only。
@@ -548,17 +631,26 @@ def _patch_sdp(torch_module):
 #       把 FLASH / cuDNN 排到最前。
 # 实测  gfx906，1x16x512x128 fp16：裸调 F.sdpa 正常，comfy.ops 失败，仅 math
 #       正常；不抛异常时会返回 NaN，也就是全黑图。
-# 失败  sdpa=missing / sdpa FAILED / comfy_ops: FAILED ...
+# 失败  [FAILED] torch sdpa=missing / [FAILED] comfy_ops ...
 # 开关  无。
 _SDPA_WRAPPED = "_zluda_math_only_sdpa"
-_HINT_SDPA = "SDPA 包装失败：注意力会退回会崩的 FLASH / cuDNN 优先级列表。"
-_HINT_SDPA_MISSING = (
-    "torch 里没有 F.scaled_dot_product_attention，注意力会退回会崩的 "
-    "FLASH / cuDNN 优先级列表。"
+_HINT_SDPA = Hint(
+    "SDPA wrapping failed: attention may fall back to the crashing FLASH / "
+    "cuDNN priority list.",
+    "SDPA 包装失败：注意力会退回会崩的 FLASH / cuDNN 优先级列表。",
 )
-_HINT_COMFY_SDPA = (
+_HINT_SDPA_MISSING = Hint(
+    "This torch has no F.scaled_dot_product_attention, so attention may fall "
+    "back to the crashing FLASH / cuDNN priority list.",
+    "torch 里没有 F.scaled_dot_product_attention，注意力会退回会崩的 "
+    "FLASH / cuDNN 优先级列表。",
+)
+_HINT_COMFY_SDPA = Hint(
+    "The comfy.ops module has no scaled_dot_product_attention, so math-only "
+    "attention was not installed; attention may fall back to the crashing "
+    "FLASH / cuDNN priority list.",
     "comfy.ops 里没有 scaled_dot_product_attention，math-only 没装上："
-    "注意力会退回会崩的 FLASH / cuDNN 优先级列表。"
+    "注意力会退回会崩的 FLASH / cuDNN 优先级列表。",
 )
 
 
@@ -585,10 +677,10 @@ def _wrap_sdpa(module, name):
 def _patch_torch_sdpa(torch_module):
     functional = torch_module.nn.functional
     if getattr(functional, "scaled_dot_product_attention", None) is None:
-        return Outcome("sdpa=missing", _HINT_SDPA_MISSING)
+        return Outcome("sdpa=missing", _HINT_SDPA_MISSING, "FAILED")
     if _wrap_sdpa(functional, "scaled_dot_product_attention"):
         return Outcome("sdpa=math-only")
-    return Outcome("sdpa=math-only[already]")
+    return Outcome("sdpa=math-only")
 
 
 # Probe replacement for older comfy.ops builds that report FLASH as usable.
@@ -609,7 +701,9 @@ def _apply_comfy_ops(module):
     # "cannot access submodule 'ops' ..."。
     if getattr(module, "scaled_dot_product_attention", None) is None:
         return Outcome(
-            "FAILED scaled_dot_product_attention is missing", _HINT_COMFY_SDPA
+            "status=missing detail=scaled_dot_product_attention",
+            _HINT_COMFY_SDPA,
+            "FAILED",
         )
     _wrap_sdpa(module, "scaled_dot_product_attention")
     for probe in (
@@ -619,7 +713,31 @@ def _apply_comfy_ops(module):
     ):
         if hasattr(module, probe):
             setattr(module, probe, _always_false)
-    return Outcome("math-only")
+
+    # MiniMax's fused activation path calls comfy_kitchen.int8_linear directly,
+    # bypassing the F.linear wrapper below. Route TensorWiseINT8 through the same
+    # eager Linear path ComfyUI uses for unsupported layouts; that path reaches
+    # F.linear, where the weight is dequantized and the bias GEMM is split.
+    #
+    # MiniMax 的融合激活路径直接调用 comfy_kitchen.int8_linear，绕过下面的
+    # F.linear 包装。TensorWiseINT8 改走 ComfyUI 给不支持的布局准备的 eager
+    # Linear 路径，从而回到 F.linear 做反量化和 bias GEMM 拆分。
+    original_input_act = getattr(module, "linear_input_act", None)
+    activations = getattr(module, "INPUT_ACT_EAGER", None)
+    int8_fusion = callable(original_input_act) and isinstance(activations, dict)
+    if int8_fusion and not getattr(original_input_act, "_zluda_eager_int8", False):
+        def _linear_input_act(linear, x, input_act):
+            weight = getattr(linear, "weight", None)
+            if getattr(weight, "_layout_cls", None) == "TensorWiseINT8Layout":
+                return linear(activations[input_act](x))
+            return original_input_act(linear, x, input_act)
+
+        _linear_input_act._zluda_eager_int8 = True
+        module.linear_input_act = _linear_input_act
+    return Outcome(_kv([
+        ("sdpa", "math-only"),
+        ("int8_fusion", "eager" if int8_fusion else "default"),
+    ]))
 
 
 # --------------------------------------------------------------------------------------------------
@@ -632,7 +750,7 @@ def _apply_comfy_ops(module):
 #           (CUBLAS_STATUS_NOT_SUPPORTED ... abType 3 computeType 72).
 # Measured  11520x3840 qkv, m=90, fp16: no cache 24.4 ms, cached 2.0 ms,
 #           native fp16 GEMM 1.34 ms.
-# Failure   linear-patch FAILED; the first forward prints a Chinese hint.
+# Failure   [FAILED] linear ...; the first forward prints English and Chinese hints.
 # Switch    ZLUDA_INT8_DEQUANT_CACHE, off by default; total ~1.5x fp16 / 3x INT8.
 #
 # 作用  把带 bias 的 linear / addmm 拆成 matmul + add，并在 F.linear 之前
@@ -641,19 +759,27 @@ def _apply_comfy_ops(module):
 #       （CUBLAS_STATUS_NOT_SUPPORTED ... abType 3 computeType 72）。
 # 实测  11520x3840 qkv，m=90，fp16：不缓存 24.4 ms，缓存 2.0 ms，同形状原生
 #       fp16 GEMM 1.34 ms。
-# 失败  linear-patch FAILED；首次前向会打一行中文提示。
+# 失败  [FAILED] linear ...；首次前向会打英文和中文提示。
 # 开关  ZLUDA_INT8_DEQUANT_CACHE，默认关；总权重约 1.5× fp16 / 3× INT8。
-_HINT_LINEAR = (
+_HINT_LINEAR = Hint(
+    "The F.linear / addmm wrapper was not installed: biased GEMMs and INT8 "
+    "models will reach the cuBLASLt paths that ZLUDA does not implement.",
     "F.linear / addmm 的包装没装上：带 bias 的 GEMM 与 INT8 模型都会走到 "
-    "ZLUDA 没实现的 cuBLASLt 路径。"
+    "ZLUDA 没实现的 cuBLASLt 路径。",
 )
-_HINT_INT8_UNCACHED = (
+_HINT_INT8_UNCACHED = Hint(
+    "INT8 tensorwise model: weights are dequantized on every forward pass. "
+    "This works but is slower than bf16 / fp8 / convrot_w4a4; set "
+    "ZLUDA_INT8_DEQUANT_CACHE=1 to cache them when VRAM allows.",
     "INT8 tensorwise 模型：每次前向都会反量化权重；可用但比 bf16 / fp8 / "
-    "convrot_w4a4 慢。显存充裕时设 ZLUDA_INT8_DEQUANT_CACHE=1 可缓存提速。"
+    "convrot_w4a4 慢。显存充裕时设 ZLUDA_INT8_DEQUANT_CACHE=1 可缓存提速。",
 )
-_HINT_INT8_CACHED = (
+_HINT_INT8_CACHED = Hint(
+    "INT8 tensorwise model: weights are dequantized to %s and cached. The "
+    "original INT8 weights remain, so total weight VRAM is about 1.5x the fp16 "
+    "model (3x the INT8 weights); large models usually do not fit on a 16 GB card.",
     "INT8 tensorwise 模型：权重会反量化成 %s 并缓存；原始 INT8 权重仍在，总权重"
-    "显存约为 fp16 模型的 1.5 倍（约 3 倍 INT8），16 GB 卡上大模型通常放不下。"
+    "显存约为 fp16 模型的 1.5 倍（约 3 倍 INT8），16 GB 卡上大模型通常放不下。",
 )
 _DEQUANT_CACHE = weakref.WeakKeyDictionary()
 _QUANT_NAMES = None
@@ -680,37 +806,45 @@ def _quant_weight_type_names():
     return _QUANT_NAMES
 
 
-# Dequantize an INT8 weight to `dtype`, optionally caching per weight object.
-# 把 INT8 权重反量化成 `dtype`，可选地按权重对象缓存。
-def _dequantize_cached(weight, dtype):
+# Dequantize an INT8 weight to `dtype` and `device`, optionally caching per
+# weight object. Both properties are part of the cache key: a weight may stay
+# alive while ComfyUI moves the model between the GPU and its offload device.
+#
+# 把 INT8 权重反量化成指定 `dtype` 和 `device`，可选地按权重对象缓存。缓存命中
+# 必须同时匹配两者：ComfyUI 在 GPU 与 offload 设备间移动模型时，权重对象可能不变。
+def _dequantize_cached(weight, dtype, device):
     if not ZLUDA_INT8_DEQUANT_CACHE:
         _report_once(
             "int8-uncached",
-            "INT8 tensorwise model: dequantizing weights on every forward pass. "
-            "This works but is slower than a bf16 / fp8 / convrot_w4a4 model; "
-            "set ZLUDA_INT8_DEQUANT_CACHE=1 to cache them if you have spare VRAM.",
+            "WARN",
+            "int8",
+            "cache=false mode=per_forward",
             _HINT_INT8_UNCACHED,
         )
-        return weight.dequantize().to(dtype=dtype)
+        return weight.dequantize().to(dtype=dtype, device=device)
     try:
         cached = _DEQUANT_CACHE.get(weight)
     except TypeError:
         # Not weak-referenceable: dequantize without caching.
         # 不可弱引用：直接反量化，不缓存。
-        return weight.dequantize().to(dtype=dtype)
-    if cached is not None and cached.dtype == dtype:
+        return weight.dequantize().to(dtype=dtype, device=device)
+    if (cached is not None and cached.dtype == dtype
+            and cached.device == device):
         return cached
-    dequantized = weight.dequantize().to(dtype=dtype)
+    dequantized = weight.dequantize().to(dtype=dtype, device=device)
     try:
         _DEQUANT_CACHE[weight] = dequantized
     except TypeError:
         pass
     _report_once(
         "int8-cached",
-        "INT8 tensorwise model: weights are dequantized to %s and cached. "
-        "The original INT8 weights stay, so total weight VRAM is about 1.5x "
-        "the fp16 model (3x the INT8 weights)." % (dtype,),
-        _HINT_INT8_CACHED % (dtype,),
+        "OK",
+        "int8",
+        _kv([("cache", True), ("dtype", dtype), ("vram", "1.5x_fp16")]),
+        Hint(
+            _HINT_INT8_CACHED.english % (dtype,),
+            _HINT_INT8_CACHED.chinese % (dtype,),
+        ),
     )
     return dequantized
 
@@ -725,7 +859,7 @@ def _patch_torch_linear(torch_module):
 
         def _linear(input, weight, bias=None):
             if type(weight).__name__ in _quant_weight_type_names():
-                weight = _dequantize_cached(weight, input.dtype)
+                weight = _dequantize_cached(weight, input.dtype, input.device)
             if bias is not None and input.is_cuda and weight.dim() == 2:
                 return torch_module.matmul(input, weight.t()) + bias
             return _original_linear(input, weight, bias)
@@ -753,7 +887,7 @@ def _patch_torch_linear(torch_module):
         torch_module.addmm = _addmm
 
     return Outcome(
-        "linear-patch[F.linear=%s]" % getattr(functional.linear, "__name__", "?")
+        _kv([("linear", getattr(functional.linear, "__name__", "?"))])
     )
 
 
@@ -765,7 +899,7 @@ def _patch_torch_linear(torch_module):
 # Cause     the launcher keeps them in .launcher/preference.json; a reset drops
 #           them, and other entry points never set them at all.
 # Measured  n/a.
-# Failure   args: FAILED ... / args: overrides disabled ...
+# Failure   [FAILED] cli_args status=failed ...
 # Switch    ZLUDA_NO_ARG_OVERRIDES, ZLUDA_RESERVE_VRAM, ZLUDA_FORCE_FP16,
 #           ZLUDA_SPLIT_ATTENTION.
 #
@@ -773,16 +907,21 @@ def _patch_torch_linear(torch_module):
 # 原因  启动器把参数存在 .launcher/preference.json 里，重置就没了；绕过
 #       main.py 的入口更是完全拿不到。
 # 实测  不适用。
-# 失败  args: FAILED ... / args: overrides disabled ...
+# 失败  [FAILED] cli_args status=failed ...
 # 开关  ZLUDA_NO_ARG_OVERRIDES、ZLUDA_RESERVE_VRAM、ZLUDA_FORCE_FP16、
 #       ZLUDA_SPLIT_ATTENTION。
-_HINT_ARGS = (
+_HINT_ARGS = Hint(
+    "The comfy.cli_args overrides did not apply: pinned memory / async offload / "
+    "cudaMallocAsync may not be disabled with the patch defaults.",
     "comfy.cli_args 的启动参数覆盖没生效：pinned memory / async offload / "
-    "cudaMallocAsync 可能没有按补丁的默认值关掉。"
+    "cudaMallocAsync 可能没有按补丁的默认值关掉。",
 )
-_HINT_ARGS_MISSING = (
+_HINT_ARGS_MISSING = Hint(
+    "The comfy.cli_args module has no args object yet, so the launch-argument "
+    "overrides were skipped: pinned memory / async offload / cudaMallocAsync may "
+    "not be disabled with the patch defaults.",
     "comfy.cli_args 还没有 args 对象，启动参数覆盖被跳过：pinned memory / "
-    "async offload / cudaMallocAsync 可能没有按补丁的默认值关掉。"
+    "async offload / cudaMallocAsync 可能没有按补丁的默认值关掉。",
 )
 
 
@@ -827,10 +966,12 @@ def _cli_overrides():
 # 把覆盖值写到 comfy.cli_args 刚构造好的 args 对象上。
 def _apply_cli_args(module):
     if ZLUDA_NO_ARG_OVERRIDES:
-        return Outcome("overrides disabled by ZLUDA_NO_ARG_OVERRIDES")
+        return Outcome("status=disabled", level="INFO")
     args = getattr(module, "args", None)
     if args is None:
-        return Outcome("FAILED parsing deferred, overrides skipped", _HINT_ARGS_MISSING)
+        return Outcome(
+            "status=deferred detail=missing_args", _HINT_ARGS_MISSING, "FAILED"
+        )
     applied = []
     for key, value in _cli_overrides().items():
         if key == "reserve_vram" and getattr(args, key, None) is not None:
@@ -838,8 +979,8 @@ def _apply_cli_args(module):
             # 启动器显式给了 --reserve-vram 时以它为准。
             continue
         setattr(args, key, value)
-        applied.append("%s=%s" % (key, value))
-    return Outcome(", ".join(applied) if applied else "nothing to override")
+        applied.append((key, value))
+    return Outcome(_kv(applied) if applied else "status=default")
 
 
 # --------------------------------------------------------------------------------------------------
@@ -852,14 +993,13 @@ def _apply_cli_args(module):
 #           (Anima) picks bf16 even when fp16 works. VAE lists differ by model.
 # Measured  fp16 9.54 TFLOPS, bf16 5.26; fp32 is fp16-speed but 2x weight memory.
 # Output    once per process:
-#             model_management: unet=<policy|comfy-order|off> | vae=<...> | flags=<pins>
+#             [INFO] model_management unet=<policy|comfy-order|off> vae=<...> flags=<pins>
 #           once per model / VAE load:
-#             model_management: unet <dtype> (policy|comfy order: <why>)
-#             model_management: vae <dtype> (policy|comfy order: <why>)
-#             model_management: manual cast <dtype> (policy: ...)
-#           "comfy would pick ..." is appended when the policy changes the answer;
-#           a quantized weight store is named in the reason ("weights uint8").
-# Failure   model_management: FAILED ... (that call is handed back to ComfyUI).
+#             [INFO] model_management kind=unet|vae dtype=<...> source=policy|comfy_order reason=<...>
+#             [INFO] model_management kind=manual_cast dtype=<...> source=policy reason=<...>
+#           comfy_choice=<...> is added when the policy changes the answer;
+#           a quantized weight store is named with weights=<...>.
+# Failure   [FAILED] model_management status=failed ... (that call is handed back to ComfyUI).
 # Switch    ZLUDA_UNET_DTYPE, ZLUDA_VAE_DTYPE (auto|comfy, one side each);
 #           ZLUDA_ALLOW_BF16=1 is the alias that sets both sides to comfy;
 #           ZLUDA_FP32_MARGIN (fp32 budget margin, default 0.9).
@@ -870,25 +1010,33 @@ def _apply_cli_args(module):
 #       fp16 也会选 bf16。不同 VAE 的列表不同。
 # 实测  fp16 9.54 TFLOPS，bf16 5.26；fp32 速度接近 fp16，但权重显存翻倍。
 # 输出  每个进程一次：
-#         model_management: unet=<policy|comfy-order|off> | vae=<...> | flags=<钉住的标志>
+#         [INFO] model_management unet=<policy|comfy-order|off> vae=<...> flags=<钉住的标志>
 #       每次模型 / VAE 加载一行：
-#         model_management: unet <dtype> (policy|comfy order: <原因>)
-#         model_management: vae <dtype> (policy|comfy order: <原因>)
-#         model_management: manual cast <dtype> (policy: ...)
-#       策略改判上游结果时追加 "comfy would pick ..."；量化权重会在原因里标出
-#       （"weights uint8"）。
-# 失败  model_management: FAILED ...（这一次调用交回 ComfyUI）。
+#         [INFO] model_management kind=unet|vae dtype=<...> source=policy|comfy_order reason=<原因>
+#         [INFO] model_management kind=manual_cast dtype=<...> source=policy reason=<原因>
+#       策略改判上游结果时追加 comfy_choice=<...>；量化权重用 weights=<...> 标出。
+# 失败  [FAILED] model_management status=failed ...（这一次调用交回 ComfyUI）。
 # 开关  ZLUDA_UNET_DTYPE、ZLUDA_VAE_DTYPE（auto|comfy，各管一侧）；
 #       ZLUDA_ALLOW_BF16=1 是别名，把两侧都设成 comfy；
 #       ZLUDA_FP32_MARGIN（fp32 预算余量，默认 0.9）。
-_HINT_MM = "model_management 补丁没装上：无法按模型 / VAE 选择 dtype。"
-_HINT_MM_NO_ARGS = (
-    "没有拿到 comfy.cli_args.args，读不到精度标志，因此两侧 dtype 策略都没有装："
-    "模型精度完全由 ComfyUI 自己决定。"
+_HINT_MM = Hint(
+    "The model_management patch was not installed: UNet / VAE dtype cannot be "
+    "selected by this policy.",
+    "model_management 补丁没装上：无法按模型 / VAE 选择 dtype。",
 )
-_HINT_MM_FALLBACK = (
+_HINT_MM_NO_ARGS = Hint(
+    "The comfy.cli_args.args object is unavailable, so the precision flags "
+    "cannot be read and both dtype policies were skipped; ComfyUI alone decides "
+    "model precision.",
+    "没有拿到 comfy.cli_args.args，读不到精度标志，因此两侧 dtype 策略都没有装："
+    "模型精度完全由 ComfyUI 自己决定。",
+)
+_HINT_MM_FALLBACK = Hint(
+    "The precision policy raised at runtime and this call was handed back to "
+    "ComfyUI's original order; the model can still load, but its dtype was not "
+    "selected by the local rule.",
     "精度策略在运行期出错，这一次已交回 ComfyUI 原顺序：模型还能加载，但 dtype "
-    "不是按本机规则选的。"
+    "不是按本机规则选的。",
 )
 
 # Precision flags a launcher may pin. They are printed once and make the
@@ -984,7 +1132,11 @@ def _apply_model_management(module):
     # 拿不到解析后的参数就读不到任何精度标志，因此两侧包装都不装，交给
     # ComfyUI 自己的函数。
     if args is None:
-        return Outcome("unet=off | vae=off | flags=unknown", _HINT_MM_NO_ARGS)
+        return Outcome(
+            _kv([("unet", "off"), ("vae", "off"), ("flags", "unknown")]),
+            _HINT_MM_NO_ARGS,
+            "FAILED",
+        )
 
     flags = _flag_list(args)
 
@@ -1038,11 +1190,16 @@ def _apply_model_management(module):
                     device, model_params, supported_dtypes, weight_dtype)
             except Exception:
                 upstream = None
-            text = "model_management: unet %s (policy: %s%s" % (
-                _dtype_name(choice), _weights_note(weight_dtype), reason)
+            fields = [
+                ("kind", "unet"),
+                ("dtype", _dtype_name(choice)),
+                ("source", "policy"),
+                ("weights", _weights_name(weight_dtype)),
+                ("reason", reason),
+            ]
             if upstream is not None and upstream != choice:
-                text += "; comfy would pick %s" % _dtype_name(upstream)
-            _report(text + ")")
+                fields.append(("comfy_choice", _dtype_name(upstream)))
+            _log("INFO", "model_management", _kv(fields))
             return choice
 
         # Log one decision ComfyUI made itself, with the reason it got it.
@@ -1051,8 +1208,13 @@ def _apply_model_management(module):
                            supported_dtypes, weight_dtype):
             result = _upstream_unet(
                 device, model_params, supported_dtypes, weight_dtype)
-            _report("model_management: unet %s (comfy order: %s)"
-                    % (_dtype_name(result), reason))
+            _log("INFO", "model_management", _kv([
+                ("kind", "unet"),
+                ("dtype", _dtype_name(result)),
+                ("source", "comfy_order"),
+                ("weights", _weights_name(weight_dtype)),
+                ("reason", reason),
+            ]))
             return result
 
         def _unet_choice(device, model_params, supported_dtypes, weight_dtype):
@@ -1132,8 +1294,11 @@ def _apply_model_management(module):
             except Exception as exc:
                 _report_once(
                     "unet-policy",
-                    "model_management: unet policy FAILED %r" % (exc,),
-                    _HINT_MM_FALLBACK)
+                    "FAILED",
+                    "model_management",
+                    "status=failed kind=unet error=%r" % (exc,),
+                    _HINT_MM_FALLBACK,
+                )
                 return original_unet_dtype(
                     device, model_params, supported_dtypes, weight_dtype)
 
@@ -1156,10 +1321,13 @@ def _apply_model_management(module):
                 and original_should_use_fp16(
                     inference_device, prioritize_performance=False)
             ):
-                _report(
-                    "model_management: manual cast float16 "
-                    "(policy: upstream bf16, weights %s)"
-                    % _weights_name(weight_dtype))
+                _log("INFO", "model_management", _kv([
+                    ("kind", "manual_cast"),
+                    ("dtype", "float16"),
+                    ("source", "policy"),
+                    ("reason", "upstream bf16"),
+                    ("weights", _weights_name(weight_dtype)),
+                ]))
                 return torch.float16
             return result
 
@@ -1180,17 +1348,25 @@ def _apply_model_management(module):
                 upstream = _upstream_vae(device, allowed_dtypes)
             except Exception:
                 upstream = None
-            text = "model_management: vae %s (policy: %s" % (
-                _dtype_name(choice), reason)
+            fields = [
+                ("kind", "vae"),
+                ("dtype", _dtype_name(choice)),
+                ("source", "policy"),
+                ("reason", reason),
+            ]
             if upstream is not None and upstream != choice:
-                text += "; comfy would pick %s" % _dtype_name(upstream)
-            _report(text + ")")
+                fields.append(("comfy_choice", _dtype_name(upstream)))
+            _log("INFO", "model_management", _kv(fields))
             return choice
 
         def _delegate_vae(reason, device, allowed_dtypes):
             result = _upstream_vae(device, allowed_dtypes)
-            _report("model_management: vae %s (comfy order: %s)"
-                    % (_dtype_name(result), reason))
+            _log("INFO", "model_management", _kv([
+                ("kind", "vae"),
+                ("dtype", _dtype_name(result)),
+                ("source", "comfy_order"),
+                ("reason", reason),
+            ]))
             return result
 
         def _vae_choice(device, allowed_dtypes):
@@ -1221,8 +1397,11 @@ def _apply_model_management(module):
             except Exception as exc:
                 _report_once(
                     "vae-policy",
-                    "model_management: vae policy FAILED %r" % (exc,),
-                    _HINT_MM_FALLBACK)
+                    "FAILED",
+                    "model_management",
+                    "status=failed kind=vae error=%r" % (exc,),
+                    _HINT_MM_FALLBACK,
+                )
                 return original_vae_dtype(device, allowed_dtypes)
 
         # Install the VAE side (list preference only).
@@ -1231,10 +1410,12 @@ def _apply_model_management(module):
             module.vae_dtype = _vae_dtype
 
     return Outcome(
-        "unet=%s | vae=%s | flags=%s"
-        % ("policy" if unet_policy else "comfy-order",
-           "fp16-priority" if vae_policy else "comfy-order",
-           "unknown" if flags is None else (",".join(flags) or "none"))
+        _kv([
+            ("unet", "policy" if unet_policy else "comfy-order"),
+            ("vae", "fp16-priority" if vae_policy else "comfy-order"),
+            ("flags", "unknown" if flags is None else (",".join(flags) or "none")),
+        ]),
+        level="INFO",
     )
 
 
@@ -1246,29 +1427,40 @@ def _apply_model_management(module):
 # Cause     the installed onnxruntime-gpu is a CUDA 12 build; ZLUDA provides
 #           CUDA 11 libraries, so the provider fails to load or crashes.
 # Measured  n/a.
-# Failure   onnxruntime: FAILED ...
+# Failure   [FAILED] onnxruntime status=failed ...
 # Switch    ZLUDA_KEEP_ONNX_CUDA.
 #
 # 作用  从 ONNX Runtime 的 provider 列表里去掉 CUDA / TensorRT。
 # 原因  装的是 CUDA 12 构建的 onnxruntime-gpu，而 ZLUDA 只有 CUDA 11 的库，
 #       provider 要么加载失败，要么直接崩。
 # 实测  不适用。
-# 失败  onnxruntime: FAILED ...
+# 失败  [FAILED] onnxruntime status=failed ...
 # 开关  ZLUDA_KEEP_ONNX_CUDA。
-_HINT_ONNX = "ONNX Runtime 的 CUDA provider 没过滤掉：相关节点会加载失败或崩溃。"
+_HINT_ONNX = Hint(
+    "ONNX Runtime's CUDA provider was not filtered out: affected nodes may fail "
+    "to load or crash.",
+    "ONNX Runtime 的 CUDA provider 没过滤掉：相关节点会加载失败或崩溃。",
+)
 
 
 # Filter the provider list, including the pybind copy the session path reads.
 # 过滤 provider 列表，包括 session 路径实际读取的 pybind 副本。
 def _apply_onnxruntime(module):
     if ZLUDA_KEEP_ONNX_CUDA:
-        return Outcome("left untouched (ZLUDA_KEEP_ONNX_CUDA)")
+        return Outcome("status=left_untouched detail=ZLUDA_KEEP_ONNX_CUDA", level="INFO")
 
     unavailable = ("CUDAExecutionProvider", "TensorrtExecutionProvider")
     original = module.get_available_providers
 
+    def _provider_name(provider):
+        # InferenceSession also accepts (name, options) tuples.
+        # InferenceSession 也接受 (名称, 选项) 元组。
+        if isinstance(provider, (tuple, list)) and provider:
+            return provider[0]
+        return provider
+
     def _filtered():
-        return [p for p in original() if p not in unavailable]
+        return [p for p in original() if _provider_name(p) not in unavailable]
 
     module.get_available_providers = _filtered
     try:
@@ -1283,18 +1475,27 @@ def _apply_onnxruntime(module):
     class _CpuInferenceSession(session):
         def __init__(self, *args, providers=None, **kwargs):
             if providers:
-                providers = [p for p in providers if p not in unavailable]
+                providers = [
+                    p for p in providers if _provider_name(p) not in unavailable
+                ]
                 providers = providers or ["CPUExecutionProvider"]
                 _report_once(
                     "onnx-cpu",
-                    "onnxruntime: forcing CPUExecutionProvider",
-                    "ONNX Runtime 强制使用 CPUExecutionProvider（CUDA 12 构建的 "
-                    "onnxruntime-gpu 在 ZLUDA 上不可用）。",
+                    "OK",
+                    "onnxruntime",
+                    "provider=CPUExecutionProvider reason=cuda_unusable",
+                    Hint(
+                        "ONNX Runtime is forced to use CPUExecutionProvider; the "
+                        "installed CUDA 12 onnxruntime-gpu build does not work "
+                        "under ZLUDA.",
+                        "ONNX Runtime 强制使用 CPUExecutionProvider（CUDA 12 构建"
+                        "的 onnxruntime-gpu 在 ZLUDA 上不可用）。",
+                    ),
                 )
             super().__init__(*args, providers=providers, **kwargs)
 
     module.InferenceSession = _CpuInferenceSession
-    return Outcome("CUDA/TensorRT providers filtered")
+    return Outcome("providers=filtered")
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1305,16 +1506,20 @@ def _apply_onnxruntime(module):
 # Cause     model_base.py multiplies the activation estimate by this factor, so
 #           ComfyUI plans as if LTXAV needs almost nothing and then runs out.
 # Measured  n/a.
-# Failure   supported_models: FAILED ...
+# Failure   [FAILED] supported_models status=failed ...
 # Switch    none.
 #
 # 作用  修正 LTXAV 的 memory_usage_factor，上游留成了 0.077。
 # 原因  model_base.py 用它乘激活显存估算，于是 ComfyUI 以为 LTXAV 几乎不吃
 #       显存，然后在 16 GB 卡上 OOM。
 # 实测  不适用。
-# 失败  supported_models: FAILED ...
+# 失败  [FAILED] supported_models status=failed ...
 # 开关  无。
-_HINT_LTXAV = "LTXAV 的显存估算没修上：16 GB 卡上可能在采样时 OOM。"
+_HINT_LTXAV = Hint(
+    "The LTXAV VRAM estimate was not corrected: a 16 GB card may run out of "
+    "memory while sampling.",
+    "LTXAV 的显存估算没修上：16 GB 卡上可能在采样时 OOM。",
+)
 
 
 # Patch LTXAV.__init__ so the factor follows the parent formula with a margin.
@@ -1339,7 +1544,7 @@ def _apply_supported_models(module):
         self.memory_usage_factor = (dim / 2048) * factor * 1.5
 
     ltxav.__init__ = _init
-    return Outcome("LTXAV memory_usage_factor patched")
+    return Outcome("memory_usage_factor=patched")
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1350,18 +1555,20 @@ def _apply_supported_models(module):
 # Cause     ZLUDA does not implement every operator; the fork replaces these
 #           unconditionally, which is expensive (every topk becomes D2H + H2D).
 # Measured  n/a.
-# Failure   ops FAILED ...
+# Failure   [FAILED] ops status=failed ...
 # Switch    ZLUDA_TOPK_CPU, ZLUDA_STFT_CPU, ZLUDA_NO_JITSCRIPT.
 #
 # 作用  可选的 topk / stft / jit.script 兜底。
 # 原因  ZLUDA 并非实现了所有算子；上游 fork 是无条件替换的，代价很大
 #       （每次 topk 都变成 D2H + H2D）。
 # 实测  不适用。
-# 失败  ops FAILED ...
+# 失败  [FAILED] ops status=failed ...
 # 开关  ZLUDA_TOPK_CPU、ZLUDA_STFT_CPU、ZLUDA_NO_JITSCRIPT。
-_HINT_OPS = (
+_HINT_OPS = Hint(
+    "Optional operator fallbacks were not installed: ZLUDA_TOPK_CPU / "
+    "ZLUDA_STFT_CPU / ZLUDA_NO_JITSCRIPT will have no effect.",
     "可选算子兜底没有装上：设了 ZLUDA_TOPK_CPU / ZLUDA_STFT_CPU / "
-    "ZLUDA_NO_JITSCRIPT 也不会生效。"
+    "ZLUDA_NO_JITSCRIPT 也不会生效。",
 )
 
 
@@ -1436,18 +1643,21 @@ def _install_operator_fallbacks(torch_module):
 # Cause     ComfyUI 0.30.2 hardcodes 28 / 36 from model_channels; extra blocks
 #           are dropped without an error and the sampled latents become NaN.
 # Measured  a 40-block BF16 Anima tune loads whole after this patch.
-# Failure   model_detection: FAILED ...
+# Failure   [FAILED] model_detection status=failed ...
 # Switch    ZLUDA_ANIMA_EXTRA_BLOCKS, on by default.
 #
 # 作用  从检查点数 Anima / Cosmos-Predict2 的层数。
 # 原因  ComfyUI 0.30.2 按 model_channels 写死 28 / 36；多出来的层被静默丢掉，
 #       采样出的 latent 变成 NaN。
 # 实测  一个 40 层、BF16 的 Anima 微调在补丁后能完整加载。
-# 失败  model_detection: FAILED ...
+# 失败  [FAILED] model_detection status=failed ...
 # 开关  ZLUDA_ANIMA_EXTRA_BLOCKS，默认开启。
-_HINT_DETECT = (
+_HINT_DETECT = Hint(
+    "The Anima / Cosmos-Predict2 block count was not corrected from the "
+    "checkpoint: tunes with extra blocks are silently truncated and generate "
+    "black images.",
     "Anima / Cosmos-Predict2 的层数没有按检查点修正：带额外层的微调会被静默"
-    "截断，出图全黑。"
+    "截断，出图全黑。",
 )
 
 
@@ -1465,19 +1675,214 @@ def _apply_model_detection(module):
             return config
         counted = count_blocks(state_dict, key_prefix + "blocks.{}.")
         if counted and config.get("num_blocks") != counted:
-            _report(
-                "model_detection: %s num_blocks %s -> %s (counted in the checkpoint)"
-                % (config.get("image_model"), config.get("num_blocks"), counted)
-            )
-            _hint(
+            _log("OK", "model_detection", _kv([
+                ("model", config.get("image_model")),
+                ("num_blocks_before", config.get("num_blocks")),
+                ("num_blocks", counted),
+                ("source", "checkpoint"),
+            ]))
+            _hint(Hint(
+                "This checkpoint has more (or different) blocks than ComfyUI "
+                "hardcodes; the patch loaded the actual file count. Without "
+                "this, the extra blocks are silently dropped and generation is "
+                "black.",
                 "这个检查点的层数比 ComfyUI 写死的多（或不同），补丁已按文件实际"
-                "层数加载；不这么做，多出来的层会被静默丢掉，出图是全黑的。"
-            )
+                "层数加载；不这么做，多出来的层会被静默丢掉，出图是全黑的。",
+            ))
             config["num_blocks"] = counted
         return config
 
     module.detect_unet_config = _detect_unet_config
-    return Outcome("extra-block tunes load whole")
+    return Outcome("extra_blocks=loaded")
+
+
+# --------------------------------------------------------------------------------------------------
+# GGUF_COMPAT — official GGUF node compatibility without editing its file
+# GGUF_COMPAT — 不修改官方 GGUF 节点文件的兼容层
+# --------------------------------------------------------------------------------------------------
+# Purpose   add return_weight/force_cast to an old GGUFModelPatcher at runtime.
+# Cause     the official GGUF node overrides patch_weight_to_device with the old
+#           three-argument signature; newer ComfyUI callers pass two more.
+# Measured  the old official node loads and runs GGUF LoRA after this wrapper.
+# Failure   [FAILED] gguf_compat status=failed ...
+# Switch    ZLUDA_GGUF_COMPAT, on by default.
+#
+# 作用  在运行时给旧版 GGUFModelPatcher 补上 return_weight 与 force_cast。
+# 原因  官方 GGUF 节点用旧的三参数签名覆盖 patch_weight_to_device，新版
+#       ComfyUI 会多传两个参数。
+# 实测  旧版官方节点加载、GGUF LoRA 采样均正常。
+# 失败  [FAILED] gguf_compat status=failed ...
+# 开关  ZLUDA_GGUF_COMPAT，默认开启。
+_HINT_GGUF = Hint(
+    "Runtime compatibility for the GGUF node was not installed: advanced weight "
+    "paths in an old node may still raise argument-count errors.",
+    "GGUF 节点的运行时兼容没有装上：旧版节点的高级权重路径仍可能报参数数量错误。",
+)
+_GGUF_LOADER_WRAPPED = "_zluda_gguf_loader"
+_GGUF_METHOD_WRAPPED = "_zluda_gguf_method"
+
+
+# Find the official GGUF nodes module without depending on its generated name.
+# 不依赖 ComfyUI 动态生成的模块名，按文件和类名找到官方 GGUF 节点模块。
+def _gguf_patcher_classes():
+    for module in list(sys.modules.values()):
+        namespace = getattr(module, "__dict__", None)
+        if not isinstance(namespace, dict):
+            continue
+        patcher = namespace.get("GGUFModelPatcher")
+        if not isinstance(patcher, type):
+            continue
+        path = getattr(module, "__file__", None)
+        if not path:
+            continue
+        normalized = path.replace("\\", "/").lower()
+        if normalized.endswith("/nodes.py") and "comfyui-gguf" in normalized:
+            yield patcher
+
+
+# Build the compatible instance method while keeping normal paths delegated.
+# 构造兼容的实例方法，普通路径继续交给原函数。
+def _make_gguf_patcher_method(original):
+    def _patch_weight_to_device(
+        self, key, device_to=None, inplace_update=False,
+        return_weight=False, force_cast=False,
+    ):
+        comfy_utils = importlib.import_module("comfy.utils")
+        if key not in self.patches:
+            if force_cast:
+                base = importlib.import_module(
+                    "comfy.model_patcher"
+                ).ModelPatcher.patch_weight_to_device
+                return base(
+                    self, key, device_to=device_to,
+                    inplace_update=inplace_update,
+                    return_weight=return_weight, force_cast=force_cast,
+                )
+            if return_weight:
+                return comfy_utils.get_attr(self.model, key)
+            return original(self, key, device_to, inplace_update)
+
+        if not return_weight:
+            return original(self, key, device_to, inplace_update)
+
+        globals_ = original.__globals__
+        is_quantized = globals_["is_quantized"]
+        move_patch = globals_["move_patch_to_device"]
+        torch = importlib.import_module("torch")
+        weight = comfy_utils.get_attr(self.model, key)
+        patches = self.patches[key]
+        if is_quantized(weight):
+            out_weight = weight.to(device_to)
+            patches = move_patch(
+                patches,
+                self.load_device if self.patch_on_device else self.offload_device,
+            )
+            out_weight.patches = [(patches, key)]
+            op = comfy_utils.get_attr(self.model, key.rsplit(".", 1)[0])
+            get_weight = getattr(op, "get_weight", None)
+            if get_weight is not None:
+                return get_weight(out_weight, torch.float32)
+            _report_once(
+                "gguf-no-get-weight",
+                "WARN",
+                "gguf_compat",
+                "status=deferred detail=get_weight_missing",
+                Hint(
+                    "The GGUF node has no get_weight(), so only the quantized "
+                    "weight with deferred patches can be returned.",
+                    "GGUF 节点缺少 get_weight()，只能返回带延迟补丁的量化权重。",
+                ),
+            )
+            return out_weight
+
+        model_management = importlib.import_module("comfy.model_management")
+        comfy_lora = importlib.import_module("comfy.lora")
+        comfy_float = importlib.import_module("comfy.float")
+        if device_to is not None:
+            temp_weight = model_management.cast_to_device(
+                weight, device_to, torch.float32, copy=True,
+            )
+        else:
+            temp_weight = weight.to(torch.float32, copy=True)
+        out_weight = comfy_lora.calculate_weight(patches, temp_weight, key)
+        return comfy_float.stochastic_rounding(out_weight, weight.dtype)
+
+    _patch_weight_to_device._zluda_gguf_method = True
+    return _patch_weight_to_device
+
+
+# Patch only old official GGUF classes; skip a version that already has the API.
+# 只包装旧版官方 GGUF 类；已经有新接口的版本直接跳过。
+def _patch_gguf_patcher():
+    for patcher in _gguf_patcher_classes():
+        method = patcher.__dict__.get("patch_weight_to_device")
+        if method is None or getattr(method, _GGUF_METHOD_WRAPPED, False):
+            continue
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            continue
+        if "return_weight" in parameters and "force_cast" in parameters:
+            _report_once(
+                "gguf-upstream",
+                "INFO",
+                "gguf_compat",
+                "status=skipped detail=upstream_compatible",
+            )
+            continue
+        patcher.patch_weight_to_device = _make_gguf_patcher_method(method)
+        _report_once(
+            "gguf-applied",
+            "OK",
+            "gguf_compat",
+            "status=applied nodes_py=untouched",
+        )
+
+
+# Wrap ComfyUI's custom-node loader and check the official GGUF module after
+# each import. Existing installs are checked immediately as well.
+#
+# 包装 ComfyUI 的自定义节点加载函数，每次导入后检查官方 GGUF 模块；已经加载
+# 的安装也会立即检查。
+def _apply_custom_node_loader(module):
+    if not ZLUDA_GGUF_COMPAT:
+        return Outcome("status=disabled", level="INFO")
+    original = getattr(module, "load_custom_node", None)
+    if not callable(original):
+        return Outcome(
+            "status=missing detail=load_custom_node", _HINT_GGUF, "FAILED"
+        )
+    if getattr(original, _GGUF_LOADER_WRAPPED, False):
+        return Outcome("status=armed", level="INFO")
+    try:
+        _patch_gguf_patcher()
+    except Exception as exc:
+        _report_once(
+            "gguf-scan-initial",
+            "FAILED",
+            "gguf_compat",
+            "status=failed stage=initial error=%r" % (exc,),
+            _HINT_GGUF,
+        )
+
+    async def _load_custom_node(*args, **kwargs):
+        try:
+            return await original(*args, **kwargs)
+        finally:
+            try:
+                _patch_gguf_patcher()
+            except Exception as exc:
+                _report_once(
+                    "gguf-scan",
+                    "FAILED",
+                    "gguf_compat",
+                    "status=failed stage=import error=%r" % (exc,),
+                    _HINT_GGUF,
+                )
+
+    _load_custom_node._zluda_gguf_loader = True
+    module.load_custom_node = _load_custom_node
+    return Outcome("status=hooked", level="INFO")
 
 
 # ==================================================================================================
@@ -1501,11 +1906,11 @@ def _apply_module_patch(patch, module):
     try:
         out = patch.apply(module)
     except Exception as exc:
-        _report("%s: FAILED %r" % (patch.key, exc))
-        _hint(patch.failure_zh)
+        _log("FAILED", patch.key, _kv([("status", "failed"), ("error", repr(exc))]))
+        _hint(patch.failure)
         return
     if out.status:
-        _report("%s: %s" % (patch.key, out.status))
+        _log(out.level, patch.key, out.status)
     if out.hint:
         _hint(out.hint)
 
@@ -1529,7 +1934,7 @@ TORCH_STEPS = (
 # Module patches run as soon as the named module finishes executing.
 # 这些模块补丁在对应模块执行完的瞬间运行。
 MODULE_PATCHES = (
-    ModulePatch("args", "comfy.cli_args", _apply_cli_args, _HINT_ARGS),
+    ModulePatch("cli_args", "comfy.cli_args", _apply_cli_args, _HINT_ARGS),
     ModulePatch(
         "model_management", "comfy.model_management", _apply_model_management, _HINT_MM
     ),
@@ -1541,20 +1946,29 @@ MODULE_PATCHES = (
     ),
     ModulePatch("comfy_ops", "comfy.ops", _apply_comfy_ops, _HINT_COMFY_SDPA),
     ModulePatch("onnxruntime", "onnxruntime", _apply_onnxruntime, _HINT_ONNX),
+    ModulePatch("gguf_compat", "nodes", _apply_custom_node_loader, _HINT_GGUF),
 )
 
 
-_HINT_TORCH_IMPORT = (
-    "补丁在导入 torch 时抛了异常。后面应紧跟 Fallback hook installed；若没有，"
-    "说明连回退钩子都没装上。"
+_HINT_TORCH_IMPORT = Hint(
+    "The patch raised while importing torch. A [WARN] torch event with "
+    "status=deferred should follow; if it does not, even the fallback hook "
+    "failed to install.",
+    "补丁在导入 torch 时抛了异常。后面应紧跟 status=deferred 的 [WARN] torch "
+    "事件；若没有，说明连回退钩子都没装上。",
 )
-_HINT_FALLBACK = (
+_HINT_FALLBACK = Hint(
+    "The import hook is installed and will patch torch after it loads; the next "
+    "'import torch' should produce a late=true torch event and an ops event.",
     "已安装导入钩子，torch 加载完成后会补打补丁；下一次 import torch 之后应出现 "
-    "Late torch= 和 ops: 两行。"
+    "late=true 的 torch 事件和 ops 事件。",
 )
-_HINT_GREP_FAILED = (
-    "上面有 FAILED 项，说明对应的子补丁没生效。状态行看起来健康并不代表全对，"
-    "请把整个 _zluda_status.txt grep 一遍 FAILED。"
+_HINT_GREP_FAILED = Hint(
+    "There are [FAILED] items above, so those sub-patches are inactive. A "
+    "healthy-looking status line does not mean everything passed; search the "
+    "whole _zluda_status.txt for [FAILED].",
+    "上面有 [FAILED] 项，说明对应的子补丁没生效。状态行看起来健康并不代表全对，"
+    "请在 _zluda_status.txt 中搜索 [FAILED]。",
 )
 
 
@@ -1572,12 +1986,13 @@ def _report_switches():
         ("vae_dtype", ZLUDA_VAE_DTYPE),
         ("arg_overrides", not ZLUDA_NO_ARG_OVERRIDES),
         ("onnx_cuda", ZLUDA_KEEP_ONNX_CUDA),
+        ("gguf_compat", ZLUDA_GGUF_COMPAT),
         ("int8_cache", ZLUDA_INT8_DEQUANT_CACHE),
         ("topk_cpu", ZLUDA_TOPK_CPU),
         ("stft_cpu", ZLUDA_STFT_CPU),
         ("no_jitscript", ZLUDA_NO_JITSCRIPT),
     )
-    _report("switches: " + " | ".join("%s=%s" % pair for pair in pairs))
+    _log("INFO", "switches", _kv(pairs))
 
 
 # Install and report the optional operator fallbacks.
@@ -1586,10 +2001,10 @@ def _report_ops(torch_module):
     try:
         applied = _install_operator_fallbacks(torch_module)
     except Exception as exc:
-        _report("ops FAILED %r" % (exc,))
+        _log("FAILED", "ops", _kv([("status", "failed"), ("error", repr(exc))]))
         _hint(_HINT_OPS)
         return
-    _report("ops: " + (", ".join(applied) if applied else "default"))
+    _log("OK", "ops", _kv([("enabled", ",".join(applied) if applied else "none")]))
 
 
 # Patch torch, print the aggregated line, then install the operator fallbacks.
@@ -1597,27 +2012,31 @@ def _report_ops(torch_module):
 def _finish_torch(torch_module, late=False):
     statuses = []
     hints = []
-    for key, step, failure_zh in TORCH_STEPS:
+    failed = False
+    for key, step, failure in TORCH_STEPS:
         try:
             out = step(torch_module)
         except Exception as exc:
-            out = Outcome("%s FAILED %r" % (key, exc), failure_zh)
+            out = Outcome(
+                "%s=error:%r" % (key, exc), failure, "FAILED"
+            )
         statuses.append(out.status)
+        failed = failed or out.level == "FAILED"
         if out.hint:
             hints.append(out.hint)
 
-    _report(
-        "%s%s | Tensile=%s | %s"
-        % (
-            "Late torch=" if late else "OK torch=",
-            torch_module.__version__,
-            os.environ.get("ROCBLAS_TENSILE_LIBPATH"),
-            " | ".join(statuses),
-        )
-    )
+    fields = [
+        ("version", torch_module.__version__),
+        ("tensile", os.environ.get("ROCBLAS_TENSILE_LIBPATH")),
+    ]
+    if late:
+        fields.append(("late", True))
+    detail = _kv(fields) + (" " + " ".join(statuses) if statuses else "")
+    level = "FAILED" if failed else ("WARN" if late else "OK")
+    _log(level, "torch", detail)
     for hint in hints:
         _hint(hint)
-    if any("FAILED" in status for status in statuses):
+    if failed:
         _hint(_HINT_GREP_FAILED)
     _report_ops(torch_module)
 
@@ -1625,11 +2044,14 @@ def _finish_torch(torch_module, late=False):
 # The bootstrap: the only place with import-time side effects.
 # 引导区：全文件唯一产生导入期副作用的地方。
 def _bootstrap():
+    # PID separates runs that happen within the same second in the append-only log.
+    # 日志是追加写入的；PID 用来区分同一秒内启动的不同进程。
+    _log("INFO", "run", _kv([("pid", os.getpid())]))
     _report_switches()
     apply_env()
 
     preload = preload_zluda()
-    _report("Preload: " + preload.status)
+    _log(preload.level, "preload", preload.status)
     if preload.hint:
         _hint(preload.hint)
 
@@ -1646,13 +2068,15 @@ def _bootstrap():
     try:
         import torch
     except Exception as exc:
-        _report("Direct import failed: %r" % (exc,))
+        _log("FAILED", "torch", _kv([
+            ("status", "failed"), ("stage", "direct"), ("error", repr(exc)),
+        ]))
         _hint(_HINT_TORCH_IMPORT)
         finder.hooks["torch"] = Hook(
             before=apply_env,
             after=lambda module: _finish_torch(module, late=True),
         )
-        _report("Fallback hook installed")
+        _log("WARN", "torch", "status=deferred fallback=true")
         _hint(_HINT_FALLBACK)
     else:
         _finish_torch(torch)
@@ -1662,7 +2086,9 @@ def _bootstrap():
         if module is not None:
             _apply_module_patch(patch, module)
 
-    _report("hooks: " + ", ".join(patch.module for patch in MODULE_PATCHES))
+    _log("INFO", "hooks", _kv([
+        ("modules", ",".join(patch.module for patch in MODULE_PATCHES)),
+    ]))
 
 
 _bootstrap()

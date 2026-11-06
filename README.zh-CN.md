@@ -11,7 +11,7 @@
 要让这套整合包在 ZLUDA 上跑通，需要且只需要三件事：
 
 1. **把 torch 换成 cu118 版本。** ZLUDA 只提供 CUDA 11 的库，用 CUDA 12+ 编译的 PyTorch 一定不行。
-2. **放入补丁 `ComfyUI\zluda_patch.py`，并在 `ComfyUI\main.py` 顶部挂一小段引导代码。** 补丁按 PART 0–3 组织，共十个单元：`PRELOAD`、`TORCH`、`SDPA`、`LINEAR`、`CLI_ARGS`、`MODEL_MANAGEMENT`、`ONNX`、`SUPPORTED_MODELS`、`OPS`、`MODEL_DETECTION`。前四个覆盖跑不起来的故障（ZLUDA DLL / Tensile、cuDNN + SDP、注意力包装、cuBLASLt 线性层 + INT8）；后六个覆盖启动参数、精度、ONNX Runtime、LTXAV、可选算子和额外层。详见[补丁原理](#补丁原理)。
+2. **放入补丁 `ComfyUI\zluda_patch.py`，并在 `ComfyUI\main.py` 顶部挂一小段引导代码。** 补丁按 PART 0–3 组织，共十一个单元：`PRELOAD`、`TORCH`、`SDPA`、`LINEAR`、`CLI_ARGS`、`MODEL_MANAGEMENT`、`ONNX`、`SUPPORTED_MODELS`、`OPS`、`MODEL_DETECTION`、`GGUF_COMPAT`。前四个覆盖跑不起来的故障（ZLUDA DLL / Tensile、cuDNN + SDP、注意力包装、cuBLASLt 线性层 + INT8）；后七个覆盖启动参数、精度、ONNX Runtime、LTXAV、可选算子、额外层和 GGUF 运行时兼容。详见[补丁原理](#补丁原理)。
 3. **四行精度可以全留“由 ComfyUI 决定”（想要最快就把三行模型精度钉成 FP16——只对支持 fp16 的模型）**：gfx906 上 bf16 只有 fp16 的 0.55 倍速，fp32 则权重显存翻倍。补丁的自动策略会在模型支持 fp16 时选 fp16，放得下 fp32 时选 fp32，否则 bf16；VAE 跟随自己的 `working_dtypes`（有 fp16 就 fp16，否则 bf16；Flux 保持 bf16）。对不列出 fp16 的 VAE 强行钉 FP16 才可能溢出成 NaN、解码出全黑图。见[精度与性能](#精度与性能实测)。
 
 ## 实测环境
@@ -80,7 +80,7 @@ python -c "import torch;print(torch.__version__, torch.version.cuda)"
 
 ### 第 2 步：放置补丁并挂到 `main.py`
 
-1. 将本仓库下的所有文件复制到整合包根目录，使补丁最终位于 `ComfyUI\zluda_patch.py`。运行时只有 [`ComfyUI\zluda_patch.py`](ComfyUI/zluda_patch.py) 会被加载；`zluda_dtype_check.py` 是可选的[离线自检](#2-一键自检)，`README*.md` 与 `LICENSE` 不是必需的。
+1. 将本仓库下的所有文件复制到整合包根目录，使补丁最终位于 `ComfyUI\zluda_patch.py`。运行时只有 [`ComfyUI\zluda_patch.py`](ComfyUI/zluda_patch.py) 会被加载；`zluda_dtype_check.py` 是可选的[离线自检](#2-一键自检)，`zluda_env_check.py` 是可选的环境诊断脚本，两者都放在整合包根目录，`README*.md` 与 `LICENSE` 不是必需的。GGUF 节点的兼容也在补丁内存中完成，不需要修改或替换 `custom_nodes` 下的任何第三方文件。
 2. 在 `ComfyUI\main.py` 的**第一行之前**插入下面这段（测试所用的 ComfyUI 版本中，第一行是 `import comfy.options`）：
 
 ```python
@@ -104,7 +104,8 @@ except Exception as _zluda_e:
         except Exception:
             pass
 
-    _zluda_print("[ZLUDA] Patch FAILED: %r" % (_zluda_e,))
+    _zluda_print("[ZLUDA] [FAILED] patch_loader status=failed error=%r" % (_zluda_e,))
+    _zluda_print("[ZLUDA] hint: The bootstrap block itself failed; check that it is before the first line of main.py and that zluda_patch.py is under ComfyUI\\.")
     _zluda_print("[ZLUDA] 说明: 引导代码本身出错：检查它是否插在 main.py 第一行之前、zluda_patch.py 是否在 ComfyUI\\ 下。")
 # ==== End of ZLUDA compatibility patch ====
 # ==== ZLUDA 兼容补丁结束 ====
@@ -142,7 +143,7 @@ except Exception as _zluda_e:
 
 四行都留在“由 ComfyUI 决定”时，补丁会按模型选：模型列表里有 fp16 就用 fp16；`[bfloat16, float32]` 模型（Lumina2、Z-Image 等，它们把 fp16 排除在外，因为 fp16 会出 NaN）在 fp32 权重放得下时用 fp32，否则 bf16；VAE 跟随自己的列表：有 fp16 就 fp16，否则 bf16（Flux 保持 bf16）。三行模型精度钉 FP16 仍是最快选项，但只对确实支持 fp16 的模型。
 
-⚠️ **VAE 这一行信任 VAE 的 `working_dtypes`。** 列表里有 fp16（例如 `[bf16, fp16, fp32]`）就用 fp16；Flux 的 `[bf16, fp32]` 没有 fp16，所以保持 bf16。对不列出 fp16 的 VAE 强行 **半精度 (FP16)** 会绕过列表，可能溢出成 NaN/全黑（实测见[精度与性能](#精度与性能实测)）。设 `ZLUDA_VAE_DTYPE=comfy` 会把这一行交回 ComfyUI 原顺序；`ZLUDA_ALLOW_BF16=1` 则同时作用于 VAE 和 UNet 两侧。如果出黑图并伴随 `RuntimeWarning: invalid value encountered in cast` 且没有 `FAILED`，先查这一行；如果是 `comfy_ops: FAILED`，那是 `SDPA` 单元。
+⚠️ **VAE 这一行信任 VAE 的 `working_dtypes`。** 列表里有 fp16（例如 `[bf16, fp16, fp32]`）就用 fp16；Flux 的 `[bf16, fp32]` 没有 fp16，所以保持 bf16。对不列出 fp16 的 VAE 强行 **半精度 (FP16)** 会绕过列表，可能溢出成 NaN/全黑（实测见[精度与性能](#精度与性能实测)）。设 `ZLUDA_VAE_DTYPE=comfy` 会把这一行交回 ComfyUI 原顺序；`ZLUDA_ALLOW_BF16=1` 则同时作用于 VAE 和 UNet 两侧。如果出黑图并伴随 `RuntimeWarning: invalid value encountered in cast` 且没有 `[FAILED]`，先查这一行；如果是 `[FAILED] comfy_ops`，那是 `SDPA` 单元。
 
 **兜底**：如果以后启动器不再转发这些行，就把 `--fp16-unet`（U-Net）和 `--fp16-text-enc`（文本编码器）写进“**高级选项 → 其他设置 → 自定义参数**”。**不要**给不列出 fp16 的 VAE（Flux）加 `--fp16-vae`，那正是上面的溢出。
 
@@ -183,7 +184,7 @@ except Exception as _zluda_e:
 
 ## 补丁原理
 
-[`ComfyUI\zluda_patch.py`](ComfyUI/zluda_patch.py) 按 PART 0–3 组织：**PART 0** 契约（路径与开关）、**PART 1** 工具（报告、环境变量解析、一套通用导入钩子的 loader/finder）、**PART 2** 十个补丁单元、**PART 3** 装配（`MODULE_PATCHES`、`TORCH_STEPS`、`_finish_torch()`、`_bootstrap()`）。下面十节按文件顺序排列，每节一个单元，统一用四段式：**现象**（用户看到什么）、**原因**（为什么会这样）、**修法**（补丁怎么做）、**代价**（有没有副作用）。代码里的单元头多一段 **失败**（`Failure`），写的是会出现在状态行里的字符串。
+[`ComfyUI\zluda_patch.py`](ComfyUI/zluda_patch.py) 按 PART 0–3 组织：**PART 0** 契约（路径与开关）、**PART 1** 工具（报告、环境变量解析、一套通用导入钩子的 loader/finder）、**PART 2** 十一个补丁单元、**PART 3** 装配（`MODULE_PATCHES`、`TORCH_STEPS`、`_finish_torch()`、`_bootstrap()`）。下面十一节按文件顺序排列，每节一个单元，统一用四段式：**现象**（用户看到什么）、**原因**（为什么会这样）、**修法**（补丁怎么做）、**代价**（有没有副作用）。代码里的单元头多一段 **失败**（`Failure`），写的是会出现在状态行里的字符串。
 
 | #   | 单元               |
 | --- | ------------------ |
@@ -197,8 +198,9 @@ except Exception as _zluda_e:
 | 8   | `SUPPORTED_MODELS` |
 | 9   | `OPS`              |
 | 10  | `MODEL_DETECTION`  |
+| 11  | `GGUF_COMPAT`      |
 
-前四个单元覆盖“跑不起来”的故障；后六个覆盖启动参数、精度、ONNX Runtime、LTXAV、可选算子和额外层。
+前四个单元覆盖“跑不起来”的故障；后七个覆盖启动参数、精度、ONNX Runtime、LTXAV、可选算子、额外层，以及在不修改第三方文件的情况下兼容官方 GGUF 节点。
 
 ### 1. `PRELOAD`
 
@@ -270,8 +272,8 @@ except Exception as _zluda_e:
   现场踩坑：第一版在 `comfy.ops` 自己的 `exec_module` 里又 `import comfy.ops`，
   会抛 `AttributeError: cannot access submodule 'ops' of module 'comfy'`；结果
   `comfy.ops` 那份没被补上，图一直是黑的。现在 `comfy.ops` 有自己的一行
-  `comfy_ops:` 状态，失败会显示成 `comfy_ops: FAILED ...`，不会再藏在 torch 行里；
-  但仍然要 grep 整个状态文件的 `FAILED`，不要只看那行。
+  `[OK] comfy_ops` / `[FAILED] comfy_ops` 事件，不会再藏在 torch 行里；
+  但仍然要搜索整个状态文件的 `[FAILED]`，不要只看那行。
 
 - **代价**：没有。FLASH / cuDNN 本来就不存在，调用一直回退到 math。S=4096、
   batch×heads=16、D=128 时：`attention_pytorch` 39.1 ms、math SDP 39.1 ms、split 26.7 ms。
@@ -279,13 +281,13 @@ except Exception as _zluda_e:
 
 ### 4. `LINEAR`
 
-**作用：** 把带 bias 的 `F.linear` / `addmm` 拆成 `matmul + add`，并在 `F.linear` 之前反量化 INT8 tensorwise 权重。
+**作用：** 把带 bias 的 `F.linear` / `addmm` 拆成 `matmul + add`，在 `F.linear` 之前反量化 INT8 tensorwise 权重，并让 MiniMax 的融合 INT8 激活路径回到这套处理。
 
 - **现象**：`CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling cublasLtMatmul ...`；INT8 tensorwise 模型是同一个调用，`abType 3 cType 10 computeType 72`（INT8 × INT8 → INT32）。
 
 - **原因**：PyTorch 对 `F.linear(x, w, b)` / `addmm` 使用**只有 cuBLASLt 实现的 bias 融合 GEMM**（`gemm_and_bias`）。ZLUDA **完全没有 cuBLASLt 实现**（5 个 DLL 里没有任何 `cublasLt*` 导出），于是 torch 会去用 `torch\lib\cublasLt64_11.dll`（NVIDIA 正版，544 MB），必然返回 `CUBLAS_STATUS_NOT_SUPPORTED`。实测：无 bias 的 `mm` / `bmm` / `baddbmm` 全部正常，**只有带 bias 的 linear / addmm 会崩**，与精度（fp16 / bf16 / fp32）无关。INT8 tensorwise 是同一件事再往下一层：`comfy_kitchen` 的 `TensorWiseINT8Layout` 最后走到 `torch._int_mm`，也就是 cuBLASLt 的 INT8 GEMM，ZLUDA 没有实现。**计算精度不是问题**：`int8_tensorwise` 会设 `quantize_input: False`，权重以 `QuantizedTensor` 原样交给 `F.linear`，从来没被反量化，`--fp16-unet` 救不了。
 
-- **修法**：带 bias 的路径拆成 `matmul` + 加法；`F.linear` 还会把 `QuantizedTensor` 权重反量化成输入 dtype；`torch.addmm` 只做 bias 拆分。反量化结果可以按权重对象缓存，开关是 `ZLUDA_INT8_DEQUANT_CACHE=1`（默认关闭）。
+- **修法**：带 bias 的路径拆成 `matmul` + 加法；`F.linear` 还会把 `QuantizedTensor` 权重反量化成输入 dtype；`torch.addmm` 只做 bias 拆分。MiniMax 的 `linear_input_act()` 对 TensorWiseINT8 改走 ComfyUI 自己的 eager Linear 回退，避免直接调用绕过 `F.linear` 的 `comfy_kitchen.int8_linear`。反量化结果可以按权重对象缓存，开关是 `ZLUDA_INT8_DEQUANT_CACHE=1`（默认关闭），缓存命中必须同时匹配输入 dtype 和设备。
 
   看 safetensors 头里的 `comfy_quant` JSON 判断模型是否受影响，而不是文件名：
 
@@ -306,7 +308,7 @@ except Exception as _zluda_e:
   | 反量化一次并缓存     | 2.0 ms   |
   | 同尺寸原生 fp16 GEMM | 1.34 ms  |
 
-  缓存**默认关闭**，因为原始 INT8 权重仍在，再存一份完整 fp16：6.14 B 模型是 5.72 GB INT8 + 11.44 GB fp16 = 17.16 GB，约为 fp16 模型的 1.5 倍（3 倍 INT8），16 GB 卡放不下。显存有余时设 `ZLUDA_INT8_DEQUANT_CACHE=1`。缓存用 `weakref.WeakKeyDictionary` 做键，模型释放时一起释放。
+  缓存**默认关闭**，因为原始 INT8 权重仍在，再存一份完整 fp16：6.14 B 模型是 5.72 GB INT8 + 11.44 GB fp16 = 17.16 GB，约为 fp16 模型的 1.5 倍（3 倍 INT8），16 GB 卡放不下。显存有余时设 `ZLUDA_INT8_DEQUANT_CACHE=1`。缓存用 `weakref.WeakKeyDictionary` 做键，模型释放时一起释放；只有 dtype 和设备都相同才复用缓存，offload 到别的设备时会重新反量化。
 
 - **代价**：能用但**不快**。优先级：真正的 `convrot_w4a4` 模型 > `fp8` 模型（它的 handler 失败时本来就会退化成反量化）> `bf16`（注意 16 GB 系统内存）。
 
@@ -355,9 +357,9 @@ except Exception as _zluda_e:
 
   VAE 单独处理：`vae_dtype()` 信任 VAE 的 `working_dtypes`：有 fp16 就 fp16，否则 bf16；显式 `--fp16-vae` / `--bf16-vae` / `--fp32-vae` 仍然优先。Flux 的 `[bf16, fp32]` 保持 bf16。
 
-  开关：`ZLUDA_UNET_DTYPE` 和 `ZLUDA_VAE_DTYPE`（默认都是 `auto`）各把**一侧**交回 ComfyUI 原顺序；`ZLUDA_ALLOW_BF16=1` 是粗粒度别名，把两侧都设成 `comfy`（`[bf16, fp16, ...]` 就回到 bf16）。显式写了的一侧优先于别名，所以 `ZLUDA_ALLOW_BF16=1 ZLUDA_UNET_DTYPE=auto` 会保留 UNet 策略、只放掉 VAE。策略自身出意外时，这一次调用会交回 ComfyUI 并记成 `FAILED`，补丁不会把模型加载搞崩。
+  开关：`ZLUDA_UNET_DTYPE` 和 `ZLUDA_VAE_DTYPE`（默认都是 `auto`）各把**一侧**交回 ComfyUI 原顺序；`ZLUDA_ALLOW_BF16=1` 是粗粒度别名，把两侧都设成 `comfy`（`[bf16, fp16, ...]` 就回到 bf16）。显式写了的一侧优先于别名，所以 `ZLUDA_ALLOW_BF16=1 ZLUDA_UNET_DTYPE=auto` 会保留 UNet 策略、只放掉 VAE。策略自身出意外时，这一次调用会交回 ComfyUI 并记成 `[FAILED] model_management status=failed`，补丁不会把模型加载搞崩。
 
-  **日志：** 每次加载模型打印一行 `[ZLUDA] model_management: unet ...`，每次加载 VAE 打印一行 `... vae ...`。行里写明 dtype 和原因（`policy:` 表示上面这套策略，`comfy order:` 表示交回 ComfyUI 自己的函数），策略改判上游结果时再追加 `comfy would pick ...`；检查点的存储 dtype 不是浮点时，原因前面会标 `weights uint8` / `weights unknown`（ComfyUI 自己那行 `model weight dtype` 说的是**推理** dtype，不是存储）。manual cast 被改判时另打一行 `... manual cast float16 (policy: upstream bf16, ...)`。启动那一行还会列出启动器钉住的精度标志（`flags=...`）：钉住的行会让策略让位，所以 `flags=fp16_unet` 表示策略装上了，但 UNet 这一行没有走它。启动器的**通用精度 = 半精度 (FP16)** 也会落到那里：ComfyUI 会把 `--force-fp16` 变成 `args.fp16_unet = True`，所以想让策略自己选，那一行必须留在“由 ComfyUI 决定”。
+  **日志：** 每次加载模型打印 `[ZLUDA] [INFO] model_management kind=unet ...`，每次加载 VAE 打印 `kind=vae ...`。`dtype=` 是最终精度，`source=policy` 表示上面这套策略，`source=comfy_order` 表示交回 ComfyUI；`reason=` 写原因，策略改判上游结果时追加 `comfy_choice=...`。`weights=uint8` / `weights=unknown` 表示检查点存储 dtype（ComfyUI 自己那行 `model weight dtype` 说的是**推理** dtype）。manual cast 被改判时输出 `kind=manual_cast dtype=float16 source=policy reason="upstream bf16"`。启动时的 `model_management` 事件还会列出启动器钉住的精度标志（`flags=...`）：`flags=fp16_unet` 表示策略装上了但没有走它。启动器的**通用精度 = 半精度 (FP16)** 也会落到那里：ComfyUI 会把 `--force-fp16` 变成 `args.fp16_unet = True`，所以想让策略自己选，那一行必须留在“由 ComfyUI 决定”。
 
 - **代价**：默认没有。`[bfloat16, float32]` 模型放得下 fp32 时会用 2 倍权重显存，换来接近 fp16 的速度；放不下就留在 bf16。VAE 的 fp16/bf16 都是 2 字节，不增加显存。
 
@@ -409,11 +411,24 @@ except Exception as _zluda_e:
 
 - **代价**：对层数与表一致的检查点没有代价；数出来的值就是检查点本身的内容。那 3 个 `pos_embedder.*` 键仍然会是 unexpected，与上游修复的行为一致——建出来的模型用 `rope3d` 位置编码，可学习的 pos embedder 不属于它。
 
-`SDPA`、`CLI_ARGS`、`MODEL_MANAGEMENT`、`ONNX`、`SUPPORTED_MODELS` 和 `MODEL_DETECTION`
-是模块级单元：它们在 `MODULE_PATCHES`（模块名 → 单元）里注册，由同一个 `sys.meta_path`
-钩子在模块执行完的瞬间应用。钩子在 `import torch` **之前**安装，所以 torch 晚到补丁时
-`comfy.ops` 仍然会被覆盖。`OPS` 由 `_finish_torch()` 在直接导入和回退两条路径上都补一次。
-文件末尾的 `_bootstrap()` 是唯一在导入时执行的代码，上面全是定义。
+### 11. `GGUF_COMPAT`
+
+**作用：** 不修改 `ComfyUI\custom_nodes\ComfyUI-GGUF\nodes.py`，在运行时给旧版官方 GGUF 节点补上新参数。
+
+- **现象**：GGUF 普通出图可能正常，但 LoRA 提取、懒权重保存或新版动态显存路径可能报参数数量不匹配。
+
+- **原因**：官方 GGUF 节点的 `GGUFModelPatcher.patch_weight_to_device()` 仍使用旧的三参数签名，而当前 ComfyUI 基类已经增加 `return_weight` 和 `force_cast`。直接修改第三方文件会让用户以后更新节点时产生冲突。
+
+- **修法**：补丁钩住 ComfyUI 的自定义节点加载函数，在官方 GGUF 模块加载完成后，只检查文件路径位于 `custom_nodes\ComfyUI-GGUF\nodes.py` 的 `GGUFModelPatcher`。如果它仍缺参数，就在内存中包装该方法；普通路径继续调用原函数，只有 `return_weight` 路径使用兼容逻辑。官方节点以后自己补好参数时，补丁检测到新签名并自动跳过。开关：`ZLUDA_GGUF_COMPAT=0`。
+
+- **代价**：启动时多扫描一次自定义节点模块，耗时可以忽略。第三方文件保持原样，可以正常更新。
+
+`SDPA`、`CLI_ARGS`、`MODEL_MANAGEMENT`、`ONNX`、`SUPPORTED_MODELS`、`MODEL_DETECTION` 和
+`GGUF_COMPAT` 是模块级单元：它们通过 `MODULE_PATCHES` 注册，由同一个 `sys.meta_path` 钩子在模块
+执行完的瞬间应用。`GGUF_COMPAT` 还会在每次自定义节点加载完成后检查官方 GGUF 模块。钩子在
+`import torch` **之前**安装，所以 torch 晚到补丁时 `comfy.ops` 仍然会被覆盖。`OPS` 由
+`_finish_torch()` 在直接导入和回退两条路径上都补一次。文件末尾的 `_bootstrap()` 是唯一在导入时
+执行的代码，上面全是定义。
 
 ## 精度与性能（实测）
 
@@ -437,9 +452,9 @@ ZLUDA 在这台机器上冒充 NVIDIA 显卡，这会让 ComfyUI 里一条**专�
 
 结论：**fp16 最快；bf16 只有 0.55 倍；fp32 约 0.95 倍，但权重显存翻倍。** 第 3 步的 Auto 策略据此选择：支持 fp16 就用 fp16，放得下 fp32 才用 fp32，否则 bf16。
 
-### 2. VAE 这一行为什么特殊
+### 2. VAE 的自动精度策略
 
-第 3 步把 VAE 留在“**由 ComfyUI 决定**”，也就是信任 VAE 的 `working_dtypes`：有 fp16 就 fp16，否则 bf16。
+VAE 虽然也使用自动选择，但不套用 UNet 的“FP32 优先”规则，而是信任自己的 `working_dtypes`：有 fp16 就 fp16，否则 bf16。
 
 Flux 的 `ae.safetensors` 是 `[bf16, fp32]`，故意排除了 fp16。对它强行“**半精度 (FP16)**”会绕过列表：5 位指数装不下激活值，溢出成 NaN，出图全黑。现场验证：只把这一行从“半精度 (FP16)”改回“由 ComfyUI 决定”，出图立刻恢复，其它设置都没动。
 
@@ -484,6 +499,8 @@ SubQuad 慢的原因：它内部的 `kv_chunk_size` 默认是 `√T`。1024×102
 - fp8 存储的模型属于数值路径变化，建议同一工作流跑两遍对比再定。
 - `comfy_kitchen int8_tensorwise` 就是 `LINEAR` 单元处理的那一类；torchao / bitsandbytes INT8 用自己的 kernel，不受 `--fp16-unet` 影响。
 
+> **第三方加载器例外：** WanVideoWrapper 自己管理精度，不经过中央 `unet_dtype()`，其 `base_precision` 默认是 `bf16`。MI50 上使用该节点时应手动改为 `fp16`（模型支持 FP16 时）；补丁不会覆盖这个显式节点选项，也不要把核心标准加载器的自动策略当成对所有自定义节点都生效。
+
 ## 验证清单
 
 ### 1. 启动日志
@@ -491,25 +508,28 @@ SubQuad 慢的原因：它内部的 `kv_chunk_size` 默认是 `√T`。1024×102
 应出现下面这几行（`<TEMP>` 指你的临时文件夹，通常是 `%LOCALAPPDATA%\Temp`）：
 
 ```
-[ZLUDA] switches: anima_extra_blocks=True | reserve_vram=1.5 | fp32_margin=0.9 | force_fp16=False | split_attention=False | allow_bf16=False | unet_dtype=auto | vae_dtype=auto | arg_overrides=True | onnx_cuda=False | int8_cache=False | topk_cpu=False | stft_cpu=False | no_jitscript=False
-[ZLUDA] Preload: zluda_dir=<TEMP>\<GUID> | loaded=5/5
-[ZLUDA] OK torch=2.7.1+cu118 | Tensile=C:\Program Files\AMD\ROCm\5.7\bin\rocblas\library | cudnn=False | sdp=math | sdpa=math-only | linear-patch[F.linear=_linear]
-[ZLUDA] ops: default
-[ZLUDA] hooks: comfy.cli_args, comfy.model_management, comfy.model_detection, comfy.supported_models, comfy.ops, onnxruntime
-[ZLUDA] args: disable_pinned_memory=True, disable_async_offload=True, disable_cuda_malloc=True, reserve_vram=1.5
-[ZLUDA] model_management: unet=policy | vae=fp16-priority | flags=none
-[ZLUDA] comfy_ops: math-only
-[ZLUDA] supported_models: LTXAV memory_usage_factor patched
-[ZLUDA] model_detection: extra-block tunes load whole
-[ZLUDA] onnxruntime: CUDA/TensorRT providers filtered
+[ZLUDA] [INFO] run pid=<进程编号>
+[ZLUDA] [INFO] switches anima_extra_blocks=true reserve_vram=1.5 fp32_margin=0.9 force_fp16=false split_attention=false allow_bf16=false unet_dtype=auto vae_dtype=auto arg_overrides=true onnx_cuda=false gguf_compat=true int8_cache=false topk_cpu=false stft_cpu=false no_jitscript=false
+[ZLUDA] [OK] preload dir=<TEMP>\<GUID> dlls=5/5
+[ZLUDA] [OK] torch version=2.7.1+cu118 tensile="C:\Program Files\AMD\ROCm\5.7\bin\rocblas\library" cudnn=false sdp=math sdpa=math-only linear=_linear
+[ZLUDA] [OK] ops enabled=none
+[ZLUDA] [INFO] hooks modules=comfy.cli_args,comfy.model_management,comfy.model_detection,comfy.supported_models,comfy.ops,onnxruntime,nodes
+[ZLUDA] [OK] cli_args disable_pinned_memory=true disable_async_offload=true disable_cuda_malloc=true reserve_vram=1.5
+[ZLUDA] [INFO] model_management unet=policy vae=fp16-priority flags=none
+[ZLUDA] [OK] comfy_ops sdpa=math-only int8_fusion=eager
+[ZLUDA] [OK] supported_models memory_usage_factor=patched
+[ZLUDA] [OK] model_detection extra_blocks=loaded
+[ZLUDA] [INFO] gguf_compat status=hooked
+[ZLUDA] [OK] onnxruntime providers=filtered
+[ZLUDA] [OK] gguf_compat status=applied nodes_py=untouched
 ```
 
-`model_management:` 还会在每次加载模型、每次加载 VAE 时各打印一行决策记录。模型和 VAE 都声明
+`model_management` 事件还会在每次加载模型、每次加载 VAE 时各打印一条决策记录。模型和 VAE 都声明
 `[bfloat16, float16, float32]` 时（Anima + Wan）：
 
 ```
-[ZLUDA] model_management: unet float16 (policy: model lists fp16; comfy would pick bfloat16)
-[ZLUDA] model_management: vae float16 (policy: fp16 in [bfloat16, float16, float32]; comfy would pick bfloat16)
+[ZLUDA] [INFO] model_management kind=unet dtype=float16 source=policy weights=bfloat16 reason="model lists fp16" comfy_choice=bfloat16
+[ZLUDA] [INFO] model_management kind=vae dtype=float16 source=policy reason="fp16 in [bfloat16, float16, float32]" comfy_choice=bfloat16
 ```
 
 `[bfloat16, float32]` 模型会打印决策用的那对数，例如
@@ -524,7 +544,7 @@ SubQuad 慢的原因：它内部的 `kv_chunk_size` 默认是 `√T`。1024×102
 manual cast 被改判时，每次加载模型会另打一行：
 
 ```
-[ZLUDA] model_management: manual cast float16 (policy: upstream bf16, weights float8_e4m3fn)
+[ZLUDA] [INFO] model_management kind=manual_cast dtype=float16 source=policy reason="upstream bf16" weights=float8_e4m3fn
 ```
 
 那里的 `weights unknown` 表示加载器没有报告存储 dtype（量化检查点）；`weights float8_e4m3fn` /
@@ -533,38 +553,41 @@ manual cast 被改判时，每次加载模型会另打一行：
 启动行和每次决策行都会追加写入整合包根目录下的 `_zluda_status.txt`（以及临时文件夹里的 `zluda_status.txt`）。
 
 > **输出约定：** 状态行一律是纯英文——方便 grep、不受控制台代码页影响，本文档也是逐字引用的。
-> 需要人来处理的提示会在**下一行**单独输出 `[ZLUDA] 说明: ...` 中文，而不是拼在状态行后面。
-> 中文行在个别控制台里可能显示成乱码，但英文行不受影响；`_zluda_status.txt` 是 UTF-8，
-> 永远是最可靠的查看位置。决策行（`unet ...` / `vae ...`）是记录而不是告警，不会跟 `说明` 行。
+> 需要人来处理的提示会在**下一行**输出 `[ZLUDA] hint: ...` 英文，再下一行输出 `[ZLUDA] 说明: ...` 中文。
+> 两行分开而不是拼在状态行后面；中文行在个别控制台里可能显示成乱码，但英文 hint 不受影响。
+> `_zluda_status.txt` 是 UTF-8，永远是最可靠的查看位置。决策行（`unet ...` / `vae ...`）是记录
+> 而不是告警，不会跟 `hint` / `说明` 行。
 
-`switches:` 最先打印，此时补丁还没开始干活。`ops:` 紧跟 torch 行；`hooks:` 在它后面，
-在第一次导入 `comfy.*` 之前。`args:` 在 `comfy.cli_args` 解析时出现；
-`model_management:`、`comfy_ops:`、`supported_models:` 在启动过程中出现（之后每次加载
-模型 / VAE，`model_management:` 还会再出现一行决策记录）；
-`model_detection:` 在模块被补时出现，之后只有真的检测到层数不同的检查点才再出现；
-`onnxruntime:` 只有真的有人导入 ONNX Runtime 时才出现（即 RMBG / controlnet_aux /
-Impact 节点运行的时候，不是启动时）。`ops: default` 表示没有开启任何可选算子兜底，
-这是预期状态；走回退路径时这一行会在 `Late torch=` 之后照样输出（`OPS` 在回退路径下
-也补上了）。
+`[INFO] run pid=` 最先打印，用进程编号区分每次运行；随后是 `[INFO] switches`。
+`[OK] ops` 紧跟 torch 行；`[INFO] hooks` 在它后面，在第一次导入 `comfy.*` 之前。
+`[OK] cli_args` 在 `comfy.cli_args` 解析时出现；`model_management`、`comfy_ops`、
+`supported_models` 在启动过程中出现（之后每次加载模型 / VAE，`model_management`
+还会再出现一条决策记录）；`model_detection` 在模块被补时出现，之后只有真的检测到
+层数不同的检查点才再出现；`gguf_compat` 在官方 GGUF 节点加载后出现。
+`onnxruntime` 只有真的有人导入 ONNX Runtime 时才出现（即 RMBG / controlnet_aux /
+Impact 节点运行的时候，不是启动时）。`[OK] ops enabled=none` 表示没有开启任何可选
+算子兜底，这是预期状态；走回退路径时这一行会在 `late=true` 的 torch 事件之后照样
+输出（`OPS` 在回退路径下也补上了）。
 
-**torch 行看起来健康并不代表全对**：`comfy.ops` 那一半有自己的一行 `comfy_ops:`，
-它可以是 `FAILED` 而 torch 行仍然显示 `sdpa=math-only`。一定要把整个状态文件 grep
-一遍 `FAILED`。
+**torch 事件看起来健康并不代表全对**：`comfy.ops` 有独立的 `comfy_ops` 事件，
+它可以是 `[FAILED]`，而 torch 事件仍显示 `sdpa=math-only`。一定要搜索整个状态文件的
+`[FAILED]`。
 
 如果日志里出现下面这些行，说明补丁没有完全生效（`failed=` 后面最多列 3 个失败项）。
-这些行后面都会紧跟一行 `说明: ...` 中文提示；中文显示成乱码时看英文行即可。
+这些行后面都会紧跟一行 `hint: ...` 英文提示，再跟一行 `说明: ...` 中文提示；
+中文显示成乱码时看英文 hint 即可。
 
 | 日志行                                                           | 含义                                                                                                                                                          | 处理                                                                                                                                                                       |
 | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `[ZLUDA] Preload: No ZLUDA dir found (nvcuda.dll not preloaded)` | 没找到含 ZLUDA DLL 的目录，`nvcuda.dll` 未预加载                                                                                                              | 先让启动器正常跑一次 ComfyUI（它会把 DLL 解到 `%TEMP%\<GUID>`）；或把 `.launcher\zluda.<hash>.extpack` 用 7-Zip 解压到整合包根目录的 `zluda\`                              |
-| `[ZLUDA] Preload: zluda_dir=... \| loaded=3/5 \| failed=...`     | 部分 DLL 加载失败                                                                                                                                             | 看 `failed=` 列出的项：`xxx.dll:missing` 是文件缺失；`WinError 193` 通常是拿到了占位文件或 HTML，而不是真正的 DLL                                                          |
-| `[ZLUDA] Direct import failed: ...`                              | 补丁在导入 torch 时抛了异常                                                                                                                                   | 后面应紧跟 `Fallback hook installed`；若没有，说明连回退钩子都没装上                                                                                                       |
-| `[ZLUDA] Fallback hook installed`                                | 已安装导入钩子，torch 加载完成后会补打补丁                                                                                                                    | 下一次 `import torch` 之后应出现 `Late torch=...`                                                                                                                          |
-| `[ZLUDA] Late torch=...`                                         | 回退路径补打补丁成功                                                                                                                                          | 确认行内 `Tensile=`、`cudnn=False`、`sdp=math`、`linear-patch[F.linear=_linear]` 都在                                                                                      |
-| 状态行里的 `sdpa=missing`                                        | 这个 torch 没有 `F.scaled_dot_product_attention`，math-only 没包上，注意力会退回会崩的 FLASH / cuDNN 优先级列表                                               | 确认 torch 版本（需要 2.0 以上）；这一项出现在 `OK torch=` 状态行里，不在单独一行                                                                                          |
-| `[ZLUDA] comfy_ops: FAILED ...`                                  | `comfy.ops` 的 math-only 包装失败，注意力会退回会崩的优先级列表                                                                                               | 确认 `comfy.ops` 是否被别的插件提前导入，或它本身没有 `scaled_dot_product_attention`（comfy 太旧）；这一行出现时 torch 行仍可能显示 `sdpa=math-only`，一定要 grep `FAILED` |
-| `[ZLUDA] <key>: FAILED ...`                                      | 某个模块的导入钩子执行失败，该模块的补丁没生效。`<key>` 是 `args`、`model_management`、`model_detection`、`supported_models`、`comfy_ops`、`onnxruntime` 之一 | 看行里的 key；`comfy_ops` 之外的模块失败通常只影响对应功能                                                                                                                 |
-| `[ZLUDA] Patch FAILED: ...`                                      | `main.py` 顶部的引导代码本身出错                                                                                                                              | 检查引导代码是否插在 `main.py` 第一行之前、`zluda_patch.py` 是否在 `ComfyUI\` 下                                                                                           |
+| `[ZLUDA] [FAILED] preload status=missing`                          | 没找到含 ZLUDA DLL 的目录，`nvcuda.dll` 未预加载                                                                                                              | 先让启动器正常跑一次 ComfyUI（它会把 DLL 解到 `%TEMP%\<GUID>`）；或把 `.launcher\zluda.<hash>.extpack` 用 7-Zip 解压到整合包根目录的 `zluda\`                              |
+| `[ZLUDA] [FAILED] preload dir=... dlls=3/5 failed=...`             | 部分 DLL 加载失败                                                                                                                                             | 看 `failed=` 列出的项：`xxx.dll:missing` 是文件缺失；`WinError 193` 通常是拿到了占位文件或 HTML，而不是真正的 DLL                                                          |
+| `[ZLUDA] [FAILED] torch status=failed stage=direct error=...`      | 补丁在导入 torch 时抛了异常                                                                                                                                   | 后面应紧跟 `[WARN] torch status=deferred fallback=true`；若没有，说明连回退钩子都没装上                                                                                    |
+| `[ZLUDA] [WARN] torch status=deferred fallback=true`             | 已安装导入钩子，torch 加载完成后会补打补丁                                                                                                                    | 下一次 `import torch` 之后应出现带 `late=true` 的 `[WARN] torch` 行                                                                                                        |
+| `[ZLUDA] [WARN] torch ... late=true`                             | 回退路径补打补丁成功                                                                                                                                          | 确认行内 `tensile=`、`cudnn=false`、`sdp=math`、`linear=_linear` 都在                                                                                                      |
+| 状态行里的 `sdpa=missing`                                        | 这个 torch 没有 `F.scaled_dot_product_attention`，math-only 没包上，注意力会退回会崩的 FLASH / cuDNN 优先级列表                                               | 确认 torch 版本（需要 2.0 以上）；这一项出现在 `torch` 事件里，不在单独一行                                                                                                 |
+| `[ZLUDA] [FAILED] comfy_ops status=missing ...`                    | `comfy.ops` 的 math-only 包装失败，注意力会退回会崩的优先级列表                                                                                               | 确认 `comfy.ops` 是否被别的插件提前导入，或它本身没有 `scaled_dot_product_attention`（comfy 太旧）；torch 行仍可能显示 `sdpa=math-only`，一定要搜索 `[FAILED]`                |
+| `[ZLUDA] [FAILED] <event> status=failed error=...`                 | 某个模块的导入钩子执行失败，该模块的补丁没生效。`<event>` 是 `cli_args`、`model_management`、`model_detection`、`supported_models`、`comfy_ops`、`onnxruntime`、`gguf_compat` 之一 | 看行里的 event；`comfy_ops` 之外的模块失败通常只影响对应功能                                                                                                                |
+| `[ZLUDA] [FAILED] patch_loader ...`                                | `main.py` 顶部的引导代码本身出错                                                                                                                              | 检查引导代码是否插在 `main.py` 第一行之前、`zluda_patch.py` 是否在 `ComfyUI\` 下                                                                                           |
 
 ### 2. 一键自检
 
@@ -574,11 +597,18 @@ Impact 节点运行的时候，不是启动时）。`ops: default` 表示没有�
 python zluda_dtype_check.py
 ```
 
-期望输出 `39 passed, 0 failed`。它会读取 `ComfyUI\zluda_patch.py`，但**不执行**末尾的引导代码
-（不预加载 DLL、不导入 torch、不写状态文件），用一个假的 `comfy.model_management` 和假的 torch
-驱动 `_apply_model_management()`，逐条断言每个策略分支返回的 dtype 以及它打印的状态文本：UNet
-六条、VAE 四条、manual cast 修正、两个分侧开关、别名，以及 fail-open 路径。把另一份补丁的路径作为
-第一个参数传进去，就可以检查别处的副本。
+期望最后一行是 `RESULT: PASS | 59 passed, 0 failed | 全部通过`。它会读取 `ComfyUI\zluda_patch.py`，但**不执行**末尾的引导代码
+（不预加载真实 DLL、不导入 torch、不写状态文件），用假模块和假的 torch 逐条断言：UNet 六条、VAE 四条、
+manual cast 修正、两个分侧开关、别名、fail-open 路径，以及 MiniMax INT8 回退、ONNX 元组 provider、
+反量化缓存、SDP 后端开关、ZLUDA 完整目录优先、GGUF 运行时兼容、双语提示一致性和结构化日志格式。把另一份补丁的路径作为第一个参数传进去，就可以检查别处的副本。
+
+需要检查实际 ZLUDA 目录、显卡和补丁状态时，在整合包根目录运行：
+
+```bat
+python zluda_env_check.py
+```
+
+两个检查脚本都放在整合包根目录；环境脚本会自动找到旁边的 `ComfyUI` 文件夹。
 
 不启动界面。在启动器的命令提示符里进入整合包的 `ComfyUI` 文件夹后运行：
 
@@ -617,7 +647,7 @@ python -c "import zluda_patch, comfy.options; comfy.options.enable_args_parsing(
 python -c "import zluda_patch, torch, comfy.model_management as mm; dev = mm.get_torch_device(); print('vae:', mm.vae_dtype(dev, [torch.bfloat16, torch.float32])); print('unet(fp16,bf16,fp32):', mm.unet_dtype(dev, supported_dtypes=[torch.float16, torch.bfloat16, torch.float32]))"
 ```
 
-期望 `vae: torch.bfloat16`、`unet(fp16,bf16,fp32): torch.float16`——UNet 策略在模型支持 fp16 时选 fp16；VAE 这一项用 `[bf16, fp32]` 检查，所以按列表返回 bf16（列表里有 fp16 的 VAE 会返回 fp16）。两次调用还会在 stderr 各打一行决策记录，例如 `[ZLUDA] model_management: unet float16 (policy: model lists fp16; comfy would pick bfloat16)`。
+期望 `vae: torch.bfloat16`、`unet(fp16,bf16,fp32): torch.float16`——UNet 策略在模型支持 fp16 时选 fp16；VAE 这一项用 `[bf16, fp32]` 检查，所以按列表返回 bf16（列表里有 fp16 的 VAE 会返回 fp16）。两次调用还会在 stderr 各打一条决策事件，例如 `[ZLUDA] [INFO] model_management kind=unet dtype=float16 source=policy reason="model lists fp16" comfy_choice=bfloat16`。
 
 ```bat
 python -c "import zluda_patch, torch, comfy.model_management as mm; dev = mm.get_torch_device(); print('small:', mm.unet_dtype(dev, 100_000_000, supported_dtypes=[torch.bfloat16, torch.float32])); print('large:', mm.unet_dtype(dev, 8_000_000_000, supported_dtypes=[torch.bfloat16, torch.float32]))"
@@ -638,14 +668,93 @@ python -c "import zluda_patch, onnxruntime as ort; print('ort:', ort.get_availab
 | ------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `pytorch version:`                                                                         | `2.7.1+cu118`                                                                                                                                                           |
 | `Total VRAM ...`                                                                           | 测试所用显卡为 `16368 MB`                                                                                                                                               |
-| `VAE load device: ..., offload device: ..., dtype:`                                        | `cuda:0` / `cpu` / VAE 的 dtype。VAE 行设成**由 ComfyUI 决定**时跟随 VAE 列表：Flux `[bf16, fp32]` → **bf16**；列表里有 fp16 的 VAE → **fp16**。出现 `float32` 说明 VAE 只允许 fp32 或设了 `--fp32-vae`。紧邻的 `[ZLUDA] model_management: vae ...` 决策行会写出同一个 dtype 和选择原因 |
-| `model weight dtype ...`                                                                   | 与紧邻的 `[ZLUDA] model_management: unet ...` 决策行一致；那一行还写明是补丁策略还是 ComfyUI 原顺序（`policy:` / `comfy order:`）。`[bfloat16, float32]` 模型只有在决策行给出 `fp32 ... <= ...` 的预算通过时才是 `torch.float32` |
+| `VAE load device: ..., offload device: ..., dtype:`                                        | `cuda:0` / `cpu` / VAE 的 dtype。VAE 行设成**由 ComfyUI 决定**时跟随 VAE 列表：Flux `[bf16, fp32]` → **bf16**；列表里有 fp16 的 VAE → **fp16**。出现 `float32` 说明 VAE 只允许 fp32 或设了 `--fp32-vae`。紧邻的 `[INFO] model_management kind=vae ...` 事件会写出同一个 dtype 和选择原因 |
+| `model weight dtype ...`                                                                   | 与紧邻的 `[INFO] model_management kind=unet ...` 事件一致；该事件还写明是补丁策略还是 ComfyUI 原顺序（`source=policy` / `source=comfy_order`）。`[bfloat16, float32]` 模型只有在事件给出 `fp32 ... <= ...` 的预算通过时才是 `torch.float32` |
 | `Using ... attention`                                                                      | `split` 或 `pytorch`，**不要** `sub quadratic`                                                                                                                          |
 | `Enabled pinned memory ...`                                                                | **不应出现**；出现说明 `CLI_ARGS` 单元没生效                                                                                                                            |
-| `[ZLUDA] onnxruntime: forcing CPUExecutionProvider`                                        | 跑 ONNX 节点时出现（后面紧跟一行 `说明: ...` 中文）；后面不应再有 `Failed to load ...onnxruntime_providers_cuda.dll`                                                    |
+| `[ZLUDA] [OK] onnxruntime provider=CPUExecutionProvider ...`                                | 跑 ONNX 节点时出现（后面紧跟英文 `hint: ...` 和中文 `说明: ...`）；后面不应再有 `Failed to load ...onnxruntime_providers_cuda.dll`                                      |
 | `Unsupported Pytorch detected. DynamicVRAM support requires Pytorch version 2.8 or later.` | **正常提示**，ComfyUI 会退回旧版 ModelPatcher，不是错误                                                                                                                 |
 
 > 读 `VAE load device` 这行时只看**第一个字段**：它是 VAE 的运行设备，出现 `cpu` 才代表“使用 CPU 运行 VAE”被打开；`offload device: cpu` 是默认的备用位置（只有加 `--gpu-only` 才会变成 `cuda:0`），与 CPU VAE 无关。
+
+## 输出约定
+
+统一原则是：**中文负责解释，英文负责稳定标识；技术名称、路径、变量名和原始错误不翻译。**
+
+### 补丁运行日志
+
+运行日志固定为 `[ZLUDA] [级别] 事件名 key=value ...`，级别是 `INFO`、`OK`、`WARN` 或 `FAILED`。需要用户处理的错误先输出英文 `hint:`，再输出中文 `说明:`：
+
+```text
+[ZLUDA] [OK] preload dir=C:\Users\Bosco\AppData\Local\Temp\<GUID> dlls=5/5
+[ZLUDA] [INFO] switches anima_extra_blocks=true reserve_vram=1.5 ...
+[ZLUDA] [INFO] model_management kind=unet dtype=float16 source=policy reason="model lists fp16"
+[ZLUDA] [OK] comfy_ops sdpa=math-only int8_fusion=eager
+```
+
+失败时：
+
+```text
+[ZLUDA] [FAILED] comfy_ops status=missing detail=scaled_dot_product_attention
+[ZLUDA] hint: The comfy.ops module has no scaled_dot_product_attention, so math-only attention was not installed.
+[ZLUDA] 说明: comfy.ops 里没有 scaled_dot_product_attention，math-only 没装上。
+```
+
+### 检查脚本
+
+检查项固定使用 `[PASS]`、`[FAILED]`、`[WARN]`、`[SKIP]`：
+
+```text
+[PASS] gguf compat: loader hooked
+[WARN] ZLUDA DLL files
+[FAILED] Torch CUDA availability
+[SKIP] ZLUDA DLL files
+```
+
+最后一行固定为：
+
+```text
+RESULT: PASS | 59 passed, 0 failed | 全部通过
+RESULT: PASS | 9 passed, 0 failed, 0 warnings, 0 skipped | 环境正常
+RESULT: FAIL | 58 passed, 1 failed | 存在失败项
+RESULT: ERROR | patch not found | 找不到补丁文件
+```
+
+`RESULT` 的含义：
+
+| 标记 | 含义 | 退出码 |
+| --- | --- | --- |
+| `PASS` | 全部通过 | `0` |
+| `WARN` | 可用，但有需要处理的警告 | `0` |
+| `FAIL` | 存在明确失败 | `1` |
+| `ERROR` | 参数、路径或脚本环境导致无法检查 | `2` |
+
+> 逐项失败标记统一为 `[FAILED]`，比 `[INFO]`、`[WARN]` 等四字母级别更长、更醒目；最终汇总仍使用 `RESULT: FAIL`，保持 `PASS/WARN/FAIL/ERROR` 四个汇总状态稳定。
+
+### 诊断标题与编码
+
+诊断脚本的章节标题先英文、后中文，正文保留中文解释和英文技术值：
+
+```text
+1. Python and working directory
+   Python 与工作目录
+
+  python      = C:\...\python.exe
+  ComfyUI dir = C:\...\ComfyUI
+```
+
+所有检查脚本和状态文件统一使用 UTF-8；控制台不能显示中文时，英文状态标记仍然可读。
+
+### 大小写约定
+
+- **状态级别和缩写保持固定大写**：`[ZLUDA]`、`[INFO]`、`[OK]`、`[WARN]`、`[FAILED]`、`[PASS]`、`[SKIP]`、`RESULT`、`GGUF`、`ONNX`、`SDPA`。
+- **事件名和键名统一小写，使用下划线分隔**：`preload`、`cli_args`、`gguf_compat`、`int8_fusion=true`。
+- **布尔值统一小写**：`true` / `false`，不再输出 `True` / `False`。
+- **英文提示正文首字母大写，并以句号结尾**：`hint: SDPA wrapping failed: ...`
+- **英文标题使用句首大写（sentence case）**：`Python and working directory`、`Torch and patch status`。
+- **测试项名称是稳定标识，保持小写开头**：`[PASS] unet: model lists fp16`，不按普通句子改成 `Unet`。
+- **路径、变量名、函数名、枚举值和原始错误一律不改大小写。**
+- **中文没有首字母大小写概念，保持原样。**
 
 ## 故障排查
 
@@ -654,8 +763,8 @@ python -c "import zluda_patch, onnxruntime as ort; print('ort:', ort.get_availab
 | `ValueError: Model "..." is corrupt or invalid... Please download the model again`                            | **文件不存在或路径错**，不是文件损坏。`comfy/utils.py`（测试版本的 122-146 行）把 `safe_open()` 的**任何**异常（含 FileNotFoundError）都报成“损坏”                   | 检查路径与文件名；不要盲目重新下载                                                                                                                   |
 | `rocBLAS error: Cannot read .../TensileLibrary.dat ... for GPU arch : gfx906` + `Fatal Python error: Aborted` | `ROCBLAS_TENSILE_LIBPATH` 指向的目录没有 gfx906 内核（常见于启动器的 `%TEMP%\<GUID>` 目录被清理或轮换）                                                              | `PRELOAD` 会把它指到 HIP SDK 的 `bin\rocblas\library`                                                                                                |
 | `CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling cublasLtMatmulAlgoGetHeuristic(...)`                    | 带 bias 的线性层 / `addmm` 走了 cuBLASLt 融合路径                                                                                                                    | `LINEAR`；先用[一键自检](#2-一键自检)确认 `F.linear` 已是 `_linear`                                                                                  |
-| `cuDNN error: CUDNN_STATUS_INTERNAL_ERROR`                                                                    | cuDNN 未关闭，**或者** `comfy.ops` 的注意力优先级把 FLASH / cuDNN 又顶回前面（`SDPA` 单元）                                                                          | `TORCH`；若仍出现，确认状态行有 `sdpa=math-only` 并 grep 状态文件里的 `FAILED`                                                                       |
-| 黑图、没有报错、日志里有 `unet unexpected: ['blocks.N...']`                                                   | 检查点的层数比 ComfyUI 为它建的层数多，多出来的层被静默丢掉，采样出的 latent 是 NaN                                                                                  | `MODEL_DETECTION` 会数检查点里的层数，`model_detection: ... num_blocks 28 -> 40` 就是它生效的标志。没有这个补丁的 ComfyUI 请升级（上游 `725e6ec60`） |
+| `cuDNN error: CUDNN_STATUS_INTERNAL_ERROR`                                                                    | cuDNN 未关闭，**或者** `comfy.ops` 的注意力优先级把 FLASH / cuDNN 又顶回前面（`SDPA` 单元）                                                                          | `TORCH`；若仍出现，确认 torch 事件有 `sdpa=math-only` 并搜索状态文件里的 `[FAILED]`                                                                     |
+| 黑图、没有报错、日志里有 `unet unexpected: ['blocks.N...']`                                                   | 检查点的层数比 ComfyUI 为它建的层数多，多出来的层被静默丢掉，采样出的 latent 是 NaN                                                                                  | `MODEL_DETECTION` 会数检查点里的层数，`[OK] model_detection ... num_blocks_before=28 num_blocks=40` 就是它生效的标志。没有这个补丁的 ComfyUI 请升级（上游 `725e6ec60`） |
 | `RuntimeError: Found no NVIDIA driver on your system`                                                         | ZLUDA DLL **没有在 `import torch` 之前**被预加载（例如手工提前 import torch，或启动器注入失效）                                                                      | `PRELOAD`；确认启动日志有 `loaded=5/5`                                                                                                               |
 | `ERROR: clip input is invalid: None`                                                                          | 用 `Load Checkpoint` 加载了**不含文本编码器**的模型（如 anima-base）                                                                                                 | 改用 `Load Diffusion Model` + `Load CLIP` + `Load VAE`，或直接用官方模板                                                                             |
 | 显存不足 / OOM                                                                                                | 16 GB 显存跑大模型                                                                                                                                                   | 降分辨率、`--fp8_e4m3fn-unet`，或把 `--reserve-vram` 从 1.5 提到 2.5。系统内存只有 16 GB 时**不要**用 `--lowvram` / `--novram`，会被换页拖死         |
@@ -663,9 +772,9 @@ python -c "import zluda_patch, onnxruntime as ort; print('ort:', ort.get_availab
 | 在启动器里点“安装 PyTorch / 安装依赖”后一切复原                                                               | 启动器按内置清单重装（它给 ComfyUI 核心钉的 Python 是 3.11.6，cu118 最高只到 2.3.1，在 3.13 上装不上）                                                               | 不要在启动器里点“安装依赖 / 切换 Torch 版本 / 重装环境”                                                                                              |
 | `CUBLAS_STATUS_NOT_SUPPORTED ... abType 3 cType 10 computeType 72`                                            | 跑了 `int8_tensorwise` 模型，走到了 `torch._int_mm`（`LINEAR` 单元）                                                                                                 | 改用 `convrot_w4a4` / `fp8` / `bf16` 模型，或接受每次调用反量化                                                                                      |
 | 出图全黑、状态行健康、`_math_only` 已生效                                                                     | VAE 行被钉成 FP16，而该 VAE 的 `working_dtypes` 不含 fp16（Flux），解码器溢出成 NaN                                                                                  | 把启动器“VAE 模型精度”改回“由 ComfyUI 决定”                                                                                                          |
-| `[ZLUDA] model_management: unet ...（comfy order: --fp16-unet）`                                              | 启动器的精度行被钉住（启动行的 `flags=` 会列出来），显式标志优先，策略不参与——这是设计行为                                                                          | 想让策略自己选，就把那一行改回“由 ComfyUI 决定”                                                                                                      |
-| `[ZLUDA] model_management: unet bfloat16 (policy: fp32 ... > ...)`                                            | `[bfloat16, float32]` 模型在权重预算（扣掉 `--reserve-vram` 和 10% 余量）里放不下 fp32，补丁为了常驻选择 bf16（fp16 的 0.55 倍速）                                   | 接受 bf16、调低 `ZLUDA_RESERVE_VRAM`，或强制 `--fp32-unet` 并观察是否部分卸载；列表里有 fp16 的模型不会走这条分支                                     |
-| RMBG / controlnet_aux / Impact 报 onnxruntime provider 错误                                                   | CUDA 12 的 `onnxruntime-gpu` provider 在 ZLUDA 下（`ONNX` 单元）                                                                                                     | 确认状态行有 `onnxruntime: CUDA/TensorRT providers filtered`                                                                                         |
+| `[ZLUDA] [INFO] model_management kind=unet ... source=comfy_order`                                            | 启动器的精度行被钉住（启动事件的 `flags=` 会列出来），显式标志优先，策略不参与——这是设计行为                                                                          | 想让策略自己选，就把那一行改回“由 ComfyUI 决定”                                                                                                      |
+| `[ZLUDA] [INFO] model_management kind=unet dtype=bfloat16 ... reason="fp32 ... > ..."`                        | `[bfloat16, float32]` 模型在权重预算（扣掉 `--reserve-vram` 和 10% 余量）里放不下 fp32，补丁为了常驻选择 bf16（fp16 的 0.55 倍速）                                   | 接受 bf16、调低 `ZLUDA_RESERVE_VRAM`，或强制 `--fp32-unet` 并观察是否部分卸载；列表里有 fp16 的模型不会走这条分支                                     |
+| RMBG / controlnet_aux / Impact 报 onnxruntime provider 错误                                                   | CUDA 12 的 `onnxruntime-gpu` provider 在 ZLUDA 下（`ONNX` 单元）                                                                                                     | 确认状态中有 `[OK] onnxruntime providers=filtered`                                                                                                   |
 
 ### 回退到原装 torch
 
@@ -731,6 +840,7 @@ pip install "https://github.com/woct0rdho/SageAttention/releases/download/v2.2.0
 | `ZLUDA_VAE_DTYPE=comfy`      | `auto` | 只把 VAE 的列表偏好交回 ComfyUI 原顺序（状态：`vae=comfy-order`）                                         |
 | `ZLUDA_FP32_MARGIN=<0..1>`   | `0.9`  | fp32 权重预算的安全余量；越小越保守，超出 (0, 1] 时回退到 0.9                                             |
 | `ZLUDA_KEEP_ONNX_CUDA=1`     | 关     | 不动 ONNX Runtime 的 provider 列表                                                                       |
+| `ZLUDA_GGUF_COMPAT=0`        | **开** | 关闭旧版官方 GGUF 节点的运行时接口兼容                                                                   |
 | `ZLUDA_INT8_DEQUANT_CACHE=1` | 关     | 缓存反量化后的 INT8 权重（原始 INT8 + fp16，约 1.5× fp16 / 3× INT8，快 12 倍）                           |
 | `ZLUDA_TOPK_CPU=1`           | 关     | 让 `torch.topk` 走 CPU                                                                                   |
 | `ZLUDA_STFT_CPU=1`           | 关     | 让 `torch.stft` / `torch.istft` 走 CPU（音频模型）                                                       |
@@ -748,6 +858,7 @@ pip install "https://github.com/woct0rdho/SageAttention/releases/download/v2.2.0
 ├── ComfyUI/
 │   └── zluda_patch.py         # 兼容补丁（复制到整合包根目录下的 ComfyUI\）
 ├── zluda_dtype_check.py       # 精度策略的离线自检脚本（复制到整合包根目录）
+├── zluda_env_check.py         # ZLUDA、显卡与补丁状态诊断（复制到整合包根目录）
 ├── LICENSE
 ├── README.md
 └── README.zh-CN.md

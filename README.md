@@ -11,7 +11,7 @@ This repository documents a setup that was **verified end to end**: the exact co
 Three things are needed to run this bundle on ZLUDA:
 
 1. **Replace torch with the cu118 build.** ZLUDA only provides CUDA 11 libraries, so a PyTorch built for CUDA 12+ cannot work.
-2. **Put the patch `ComfyUI\zluda_patch.py` in place and hook it into the top of `ComfyUI\main.py`** with a short bootstrap block. The patch is organized as PART 0-3 with ten units: `PRELOAD`, `TORCH`, `SDPA`, `LINEAR`, `CLI_ARGS`, `MODEL_MANAGEMENT`, `ONNX`, `SUPPORTED_MODELS`, `OPS` and `MODEL_DETECTION`. The first four cover the failures that stop a run (ZLUDA DLLs / Tensile, cuDNN + SDP, the attention wrapper, cuBLASLt linear + INT8); the rest cover launch arguments, precision, ONNX Runtime, the LTXAV estimate, optional operator fallbacks and extra-block Anima tunes. See [How the patch works](#how-the-patch-works).
+2. **Put the patch `ComfyUI\zluda_patch.py` in place and hook it into the top of `ComfyUI\main.py`** with a short bootstrap block. The patch is organized as PART 0-3 with eleven units: `PRELOAD`, `TORCH`, `SDPA`, `LINEAR`, `CLI_ARGS`, `MODEL_MANAGEMENT`, `ONNX`, `SUPPORTED_MODELS`, `OPS`, `MODEL_DETECTION` and `GGUF_COMPAT`. The first four cover the failures that stop a run (ZLUDA DLLs / Tensile, cuDNN + SDP, the attention wrapper, cuBLASLt linear + INT8); the rest cover launch arguments, precision, ONNX Runtime, the LTXAV estimate, optional operator fallbacks, extra-block Anima tunes and GGUF runtime compatibility. See [How the patch works](#how-the-patch-works).
 3. **Leave the four precision rows on **Let ComfyUI decide** (or pin the three model rows to FP16 for maximum speed, only for models that support fp16)**: on gfx906 bf16 runs at only 0.55x the fp16 speed, and fp32 doubles the weight memory. The patch's Auto policy picks fp16 when the model supports it, fp32 when it fits, otherwise bf16; the VAE follows its own `working_dtypes` (fp16 if listed, otherwise bf16; Flux stays bf16). Forcing Half Precision (FP16) on a VAE that does not list it can overflow to NaN and decode a black image. See [Precision and performance](#precision-and-performance-measured).
 
 ## Tested environment
@@ -80,7 +80,7 @@ python -c "import torch;print(torch.__version__, torch.version.cuda)"
 
 ### Step 2: Install the patch and hook it into `main.py`
 
-1. Copy all files of this repository into the package root, so that the patch ends up at `ComfyUI\zluda_patch.py`. Only [`ComfyUI\zluda_patch.py`](ComfyUI/zluda_patch.py) runs; `zluda_dtype_check.py` is the optional [offline self-check](#2-one-shot-self-check-does-not-start-the-ui), and `README*.md` / `LICENSE` are not needed.
+1. Copy all files of this repository into the package root, so that the patch ends up at `ComfyUI\zluda_patch.py`. Only [`ComfyUI\zluda_patch.py`](ComfyUI/zluda_patch.py) runs; `zluda_dtype_check.py` is the optional [offline self-check](#2-one-shot-self-check-does-not-start-the-ui), `zluda_env_check.py` is the optional environment diagnostic, both live in the package root, and `README*.md` / `LICENSE` are not needed. GGUF node compatibility is also handled in memory by the patch, so no third-party file under `custom_nodes` has to be edited or replaced.
 2. Insert the following block **before the first line** of `ComfyUI\main.py` (in the tested ComfyUI version the first line is `import comfy.options`):
 
 ```python
@@ -104,7 +104,8 @@ except Exception as _zluda_e:
         except Exception:
             pass
 
-    _zluda_print("[ZLUDA] Patch FAILED: %r" % (_zluda_e,))
+    _zluda_print("[ZLUDA] [FAILED] patch_loader status=failed error=%r" % (_zluda_e,))
+    _zluda_print("[ZLUDA] hint: The bootstrap block itself failed; check that it is before the first line of main.py and that zluda_patch.py is under ComfyUI\\.")
     _zluda_print("[ZLUDA] 说明: 引导代码本身出错：检查它是否插在 main.py 第一行之前、zluda_patch.py 是否在 ComfyUI\\ 下。")
 # ==== End of ZLUDA compatibility patch ====
 # ==== ZLUDA 兼容补丁结束 ====
@@ -142,7 +143,7 @@ Select **Use Legacy (Split) Optimization Scheme**. Do **not** add `--use-split-c
 
 With all four rows at **Let ComfyUI decide**, the patch picks the dtype per model: fp16 when the model's list contains it; for `[bfloat16, float32]` models (Lumina2, Z-Image, which leave fp16 out because it produces NaNs) fp32 when the fp32 weights fit the budget, otherwise bf16. The VAE follows its own list: fp16 if listed, otherwise bf16 (Flux stays bf16). Pinning the three model rows to **Half Precision (FP16)** is still the fastest option, but only for models that actually support fp16.
 
-⚠️ **The VAE row trusts the VAE's `working_dtypes`.** A VAE that lists fp16 (e.g., `[bf16, fp16, fp32]`) uses fp16; Flux's `[bf16, fp32]` has no fp16, so it stays bf16. Forcing **Half Precision (FP16)** on a VAE that does not list it bypasses the list and can overflow to NaN/black (the measured case in [Precision and performance](#precision-and-performance-measured)). `ZLUDA_VAE_DTYPE=comfy` puts this row back on ComfyUI's original order, and `ZLUDA_ALLOW_BF16=1` does the same for both the VAE and the UNet policy. If you get a black image plus `RuntimeWarning: invalid value encountered in cast` with no `FAILED`, check this row; `comfy_ops: FAILED` instead points to the `SDPA` unit.
+⚠️ **The VAE row trusts the VAE's `working_dtypes`.** A VAE that lists fp16 (e.g., `[bf16, fp16, fp32]`) uses fp16; Flux's `[bf16, fp32]` has no fp16, so it stays bf16. Forcing **Half Precision (FP16)** on a VAE that does not list it bypasses the list and can overflow to NaN/black (the measured case in [Precision and performance](#precision-and-performance-measured)). `ZLUDA_VAE_DTYPE=comfy` puts this row back on ComfyUI's original order, and `ZLUDA_ALLOW_BF16=1` does the same for both the VAE and the UNet policy. If you get a black image plus `RuntimeWarning: invalid value encountered in cast` with no `[FAILED]`, check this row; `[FAILED] comfy_ops` instead points to the `SDPA` unit.
 
 **Fallback:** if a future launcher stops forwarding the rows, write `--fp16-unet` (U-Net) and `--fp16-text-enc` (text encoder) under **Advanced → Other Settings → Custom Arguments**. Do **not** add `--fp16-vae` for a VAE that does not list fp16 (Flux); that is the overflow above.
 
@@ -183,7 +184,7 @@ Workflow: use the template bundled with the package, `ComfyUI\blueprints\Text to
 
 ## How the patch works
 
-[`ComfyUI\zluda_patch.py`](ComfyUI/zluda_patch.py) is organized as PART 0-3: **PART 0** contract (paths and switches), **PART 1** toolkit (reporting, env parsing, one generic import-hook loader/finder), **PART 2** the ten patch units, and **PART 3** assembly (`MODULE_PATCHES`, `TORCH_STEPS`, `_finish_torch()`, `_bootstrap()`). The ten sections below follow the file order; each section is one unit and uses the same four labels: **Symptom** (what the user sees), **Reason** (why it happens), **Fix** (what the patch does) and **Cost** (whether there is a downside). The unit's own header in the code adds a fifth label, **Failure**, for the status string.
+[`ComfyUI\zluda_patch.py`](ComfyUI/zluda_patch.py) is organized as PART 0-3: **PART 0** contract (paths and switches), **PART 1** toolkit (reporting, env parsing, one generic import-hook loader/finder), **PART 2** the eleven patch units, and **PART 3** assembly (`MODULE_PATCHES`, `TORCH_STEPS`, `_finish_torch()`, `_bootstrap()`). The eleven sections below follow the file order; each section is one unit and uses the same four labels: **Symptom** (what the user sees), **Reason** (why it happens), **Fix** (what the patch does) and **Cost** (whether there is a downside). The unit's own header in the code adds a fifth label, **Failure**, for the status string.
 
 | #   | Unit               |
 | --- | ------------------ |
@@ -197,8 +198,9 @@ Workflow: use the template bundled with the package, `ComfyUI\blueprints\Text to
 | 8   | `SUPPORTED_MODELS` |
 | 9   | `OPS`              |
 | 10  | `MODEL_DETECTION`  |
+| 11  | `GGUF_COMPAT`      |
 
-The first four units cover the failures that stop a run; the remaining six cover launch arguments, precision, ONNX Runtime, the LTXAV estimate, optional operator fallbacks and extra-block tunes.
+The first four units cover the failures that stop a run; the remaining seven cover launch arguments, precision, ONNX Runtime, the LTXAV estimate, optional operator fallbacks, extra-block tunes and GGUF compatibility without editing the third-party node.
 
 ### 1. `PRELOAD`
 
@@ -276,9 +278,9 @@ The first four units cover the failures that stop a run; the remaining six cover
   Field gotcha: the first version re-imported `comfy.ops` inside its own `exec_module`,
   which raises `AttributeError: cannot access submodule 'ops' of module 'comfy' (most likely
 due to a circular import)`. The `comfy.ops` half stayed unpatched and the images stayed
-  black. The current layout gives `comfy.ops` its own `comfy_ops:` status line, so a failure
-  shows up as `comfy_ops: FAILED ...` instead of hiding in the torch line; still grep the
-  whole status file for `FAILED` rather than trusting a healthy-looking line.
+  black. The current layout gives `comfy.ops` its own `[OK] comfy_ops` / `[FAILED] comfy_ops`
+  event, so a failure no longer hides in the torch line; still search the whole status file
+  for `[FAILED]` rather than trusting a healthy-looking line.
 
 - **Cost:** none. FLASH and cuDNN never existed here, so the call always fell back to math.
   At S = 4096, batch×heads = 16, D = 128: `attention_pytorch` 39.1 ms, math SDP 39.1 ms,
@@ -287,13 +289,13 @@ due to a circular import)`. The `comfy.ops` half stayed unpatched and the images
 
 ### 4. `LINEAR`
 
-**What it does:** splits biased `F.linear` / `addmm` into `matmul + add`, and dequantizes INT8 tensorwise weights before `F.linear`.
+**What it does:** splits biased `F.linear` / `addmm` into `matmul + add`, dequantizes INT8 tensorwise weights before `F.linear`, and routes MiniMax's fused INT8 activation path back through the same handling.
 
 - **Symptom:** `CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling cublasLtMatmul ...`; for an INT8 tensorwise model the same call carries `abType 3 cType 10 computeType 72` (INT8 × INT8 → INT32).
 
 - **Reason:** PyTorch runs `F.linear(x, w, b)` / `addmm` through a **bias-fused GEMM that only exists in cuBLASLt** (`gemm_and_bias`). ZLUDA has **no cuBLASLt implementation at all** (none of its 5 DLLs exports a `cublasLt*` symbol), so torch falls back to NVIDIA's genuine `torch\lib\cublasLt64_11.dll` (544 MB), which necessarily returns `CUBLAS_STATUS_NOT_SUPPORTED`. Measured: `mm` / `bmm` / `baddbmm` without bias all work; **only linear / addmm with a bias crash**, regardless of precision (fp16 / bf16 / fp32). INT8 tensorwise is the same story one layer down: `comfy_kitchen`'s `TensorWiseINT8Layout` handler ends in `torch._int_mm`, a cuBLASLt INT8 GEMM that ZLUDA does not implement. The compute dtype is **not** the problem: `int8_tensorwise` sets `quantize_input: False`, so the weight reaches `F.linear` as a `QuantizedTensor` and is never dequantized — `--fp16-unet` cannot help.
 
-- **Fix:** the biased path is split into `matmul` + add; `F.linear` also dequantizes a `QuantizedTensor` weight to the input dtype. `torch.addmm` gets the bias split only. The dequantized weight can be cached per weight object with `ZLUDA_INT8_DEQUANT_CACHE=1` (off by default).
+- **Fix:** the biased path is split into `matmul` + add; `F.linear` also dequantizes a `QuantizedTensor` weight to the input dtype. `torch.addmm` gets the bias split only. For TensorWiseINT8, MiniMax's `linear_input_act()` is routed through ComfyUI's own eager Linear fallback instead of calling `comfy_kitchen.int8_linear` directly and bypassing `F.linear`. The dequantized weight can be cached per weight object with `ZLUDA_INT8_DEQUANT_CACHE=1` (off by default); a cache hit must match both the input dtype and device.
 
   Read the `comfy_quant` JSON blobs in the safetensors header, not the file name, to tell whether a model is affected:
 
@@ -314,7 +316,7 @@ due to a circular import)`. The `comfy.ops` half stayed unpatched and the images
   | dequantize once + cache         | 2.0 ms   |
   | native fp16 GEMM, same shape    | 1.34 ms  |
 
-  The cache is **off by default** because it keeps the original INT8 weights and adds a full fp16 copy: for a 6.14 B model, 5.72 GB of INT8 plus 11.44 GB of fp16 is 17.16 GB total, about 1.5x the fp16 model (3x the INT8 weights), which does not fit on a 16 GB card. Set `ZLUDA_INT8_DEQUANT_CACHE=1` only when there is spare VRAM. The cache is keyed with `weakref.WeakKeyDictionary`, so it is released together with the model.
+  The cache is **off by default** because it keeps the original INT8 weights and adds a full fp16 copy: for a 6.14 B model, 5.72 GB of INT8 plus 11.44 GB of fp16 is 17.16 GB total, about 1.5x the fp16 model (3x the INT8 weights), which does not fit on a 16 GB card. Set `ZLUDA_INT8_DEQUANT_CACHE=1` only when there is spare VRAM. The cache is keyed with `weakref.WeakKeyDictionary`, so it is released together with the model. Entries are reused only when both dtype and device match; offloading to another device dequantizes the weight again.
 
 - **Cost:** usable, not fast. Prefer, in order: a real `convrot_w4a4` model (comfy_kitchen's own kernel), an `fp8` model (its handler already falls back to dequantization on failure), then `bf16` — but watch the 16 GB of system RAM with large bf16 models.
 
@@ -363,9 +365,9 @@ due to a circular import)`. The `comfy.ops` half stayed unpatched and the images
 
   The VAE is handled separately: `vae_dtype()` trusts the VAE's `working_dtypes`: fp16 if listed, otherwise bf16; explicit `--fp16-vae` / `--bf16-vae` / `--fp32-vae` still win. Flux's `[bf16, fp32]` stays bf16.
 
-  Switches: `ZLUDA_UNET_DTYPE` and `ZLUDA_VAE_DTYPE` (`auto` by default) send **one side** back to ComfyUI's order; `ZLUDA_ALLOW_BF16=1` is the coarse alias that sets both sides to `comfy`, so `[bf16, fp16, ...]` goes back to bf16. An explicit side wins over the alias, so `ZLUDA_ALLOW_BF16=1 ZLUDA_UNET_DTYPE=auto` keeps the UNet policy and drops only the VAE one. If the policy itself raises, that one call is handed back to ComfyUI and reported as `FAILED`, so the patch cannot break a model load.
+  Switches: `ZLUDA_UNET_DTYPE` and `ZLUDA_VAE_DTYPE` (`auto` by default) send **one side** back to ComfyUI's order; `ZLUDA_ALLOW_BF16=1` is the coarse alias that sets both sides to `comfy`, so `[bf16, fp16, ...]` goes back to bf16. An explicit side wins over the alias, so `ZLUDA_ALLOW_BF16=1 ZLUDA_UNET_DTYPE=auto` keeps the UNet policy and drops only the VAE one. If the policy itself raises, that one call is handed back to ComfyUI and reported as `[FAILED] model_management status=failed`, so the patch cannot break a model load.
 
-  **Log:** every model load prints one `[ZLUDA] model_management: unet ...` line and every VAE load one `... vae ...` line. The line names the dtype and the reason (`policy:` for the rules above, `comfy order:` when ComfyUI's own function decided), appends `comfy would pick ...` when the policy changed the answer, and prefixes `weights uint8` / `weights unknown` when the checkpoint's storage dtype is not a float (ComfyUI's own `model weight dtype` line is the **inference** dtype, not the storage). A manual-cast correction prints its own `... manual cast float16 (policy: upstream bf16, ...)` line. The startup line also lists the precision flags the launcher pinned (`flags=...`): a pinned row makes the policy step aside, so `flags=fp16_unet` means the policy is installed but was not consulted for the UNet row. A launcher **General Precision = Half Precision (FP16)** also lands there: ComfyUI turns `--force-fp16` into `args.fp16_unet = True`, so that row has to stay on **Let ComfyUI decide** if you want the policy to choose.
+  **Log:** every model load prints `[ZLUDA] [INFO] model_management kind=unet ...` and every VAE load `kind=vae ...`. `dtype=` is the final dtype; `source=policy` means the rules above, `source=comfy_order` means ComfyUI decided; `reason=` gives the cause, and `comfy_choice=...` is added when the policy changed the answer. `weights=uint8` / `weights=unknown` describes the checkpoint storage dtype (ComfyUI's own `model weight dtype` line is the **inference** dtype). A manual-cast correction emits `kind=manual_cast dtype=float16 source=policy reason="upstream bf16"`. The startup `model_management` event also lists the precision flags the launcher pinned (`flags=...`): `flags=fp16_unet` means the policy is installed but was not consulted for the UNet row. A launcher **General Precision = Half Precision (FP16)** also lands there: ComfyUI turns `--force-fp16` into `args.fp16_unet = True`, so that row has to stay on **Let ComfyUI decide** if you want the policy to choose.
 
 - **Cost:** none by default. When a `[bfloat16, float32]` model fits in fp32, it uses 2x the weight memory of bf16 — that is the trade-off for its 0.95x speed; otherwise it stays on bf16. VAE fp16 and bf16 are both 2 bytes, so the VAE choice costs no memory.
 
@@ -432,9 +434,22 @@ due to a circular import)`. The `comfy.ops` half stayed unpatched and the images
   contains. The 3 `pos_embedder.*` keys stay unexpected exactly as they do with the upstream fix — the built model uses
   `rope3d` positional encoding, so a learnable pos embedder is not part of it.
 
-`SDPA`, `CLI_ARGS`, `MODEL_MANAGEMENT`, `ONNX`, `SUPPORTED_MODELS` and `MODEL_DETECTION` are
-module-level units: they are registered in `MODULE_PATCHES` (module name → unit) and applied
-through a single `sys.meta_path` hook right after the module executes. The hooks are installed
+### 11. `GGUF_COMPAT`
+
+**What it does:** adds the missing ModelPatcher arguments at runtime without editing `ComfyUI\custom_nodes\ComfyUI-GGUF\nodes.py`.
+
+- **Symptom:** normal GGUF generation may work, but LoRA extraction, lazy weight saving or a future dynamic-VRAM path can raise an argument-count error.
+
+- **Reason:** the official GGUF node overrides `GGUFModelPatcher.patch_weight_to_device()` with the old three-argument signature, while the current ComfyUI base class also passes `return_weight` and `force_cast`. Editing the third-party file directly creates conflicts on every node update.
+
+- **Fix:** the patch hooks ComfyUI's custom-node loader and checks the `GGUFModelPatcher` whose file ends in `custom_nodes\ComfyUI-GGUF\nodes.py`. If it lacks the new parameters, the method is wrapped in memory. Normal calls still delegate to the original; only the `return_weight` path uses the compatibility logic. A future upstream node that already has the parameters is detected and skipped. Switch: `ZLUDA_GGUF_COMPAT=0`.
+
+- **Cost:** one extra scan after each custom-node import; negligible. The third-party file stays official and can be updated normally.
+
+`SDPA`, `CLI_ARGS`, `MODEL_MANAGEMENT`, `ONNX`, `SUPPORTED_MODELS`, `MODEL_DETECTION` and
+`GGUF_COMPAT` are module-level units: they are registered in `MODULE_PATCHES` and applied
+through a single `sys.meta_path` hook right after the module executes. `GGUF_COMPAT` additionally
+checks the official GGUF module after every custom-node import. The hooks are installed
 **before** `import torch`, so the fallback path where `torch` loads late still covers
 `comfy.ops`. `OPS` is applied from `_finish_torch()`, on both the direct and the late path.
 The bootstrap at the bottom of the file is the only code that runs at import time; everything
@@ -462,9 +477,9 @@ ZLUDA impersonates an NVIDIA card on this machine, which defeats a rule in Comfy
 
 Conclusion: **fp16 is the fastest; bf16 is 0.55x; fp32 is 0.95x but needs 2x the weight memory.** Step 3's Auto policy uses this: fp16 where supported, fp32 only when it fits, otherwise bf16.
 
-### 2. Why the VAE row is special
+### 2. VAE automatic precision policy
 
-Step 3 keeps the VAE on **Let ComfyUI decide**, which trusts the VAE's `working_dtypes`: fp16 if listed, otherwise bf16.
+The VAE is also selected automatically, but it does not use the UNet's fp32-first rule. It follows its own `working_dtypes`: fp16 if listed, otherwise bf16.
 
 Flux's `ae.safetensors` is `[bf16, fp32]` — it deliberately excludes fp16. Forcing **Half Precision (FP16)** on it bypasses the list: the decoder's 5-bit exponent cannot hold the VAE's activations, they overflow to NaN, and the image comes out black. Field check: switching only this row from **Half Precision (FP16)** to **Let ComfyUI decide** made generation work, with everything else unchanged.
 
@@ -509,6 +524,8 @@ For the tested 6.14 B model: INT8 5.72 GB, fp16 11.44 GB, fp32 22.88 GB; `int8_t
 - fp8-stored models change the numeric path, so run the same workflow twice and compare before deciding.
 - `comfy_kitchen int8_tensorwise` is the case handled by the `LINEAR` unit; torchao / bitsandbytes INT8 uses its own kernels and is not affected by `--fp16-unet`.
 
+> **Third-party loader exception:** WanVideoWrapper manages precision itself and does not call the central `unet_dtype()`; its `base_precision` defaults to `bf16`. On MI50, select `fp16` manually when the model supports FP16. The patch does not override this explicit node option, and the standard loader's automatic policy must not be assumed to cover every custom node.
+
 ## Verification
 
 ### 1. Startup log
@@ -516,25 +533,28 @@ For the tested 6.14 B model: INT8 5.72 GB, fp16 11.44 GB, fp32 22.88 GB; `int8_t
 These lines should appear (`<TEMP>` is your temp folder, usually `%LOCALAPPDATA%\Temp`):
 
 ```
-[ZLUDA] switches: anima_extra_blocks=True | reserve_vram=1.5 | fp32_margin=0.9 | force_fp16=False | split_attention=False | allow_bf16=False | unet_dtype=auto | vae_dtype=auto | arg_overrides=True | onnx_cuda=False | int8_cache=False | topk_cpu=False | stft_cpu=False | no_jitscript=False
-[ZLUDA] Preload: zluda_dir=<TEMP>\<GUID> | loaded=5/5
-[ZLUDA] OK torch=2.7.1+cu118 | Tensile=C:\Program Files\AMD\ROCm\5.7\bin\rocblas\library | cudnn=False | sdp=math | sdpa=math-only | linear-patch[F.linear=_linear]
-[ZLUDA] ops: default
-[ZLUDA] hooks: comfy.cli_args, comfy.model_management, comfy.model_detection, comfy.supported_models, comfy.ops, onnxruntime
-[ZLUDA] args: disable_pinned_memory=True, disable_async_offload=True, disable_cuda_malloc=True, reserve_vram=1.5
-[ZLUDA] model_management: unet=policy | vae=fp16-priority | flags=none
-[ZLUDA] comfy_ops: math-only
-[ZLUDA] supported_models: LTXAV memory_usage_factor patched
-[ZLUDA] model_detection: extra-block tunes load whole
-[ZLUDA] onnxruntime: CUDA/TensorRT providers filtered
+[ZLUDA] [INFO] run pid=<process id>
+[ZLUDA] [INFO] switches anima_extra_blocks=true reserve_vram=1.5 fp32_margin=0.9 force_fp16=false split_attention=false allow_bf16=false unet_dtype=auto vae_dtype=auto arg_overrides=true onnx_cuda=false gguf_compat=true int8_cache=false topk_cpu=false stft_cpu=false no_jitscript=false
+[ZLUDA] [OK] preload dir=<TEMP>\<GUID> dlls=5/5
+[ZLUDA] [OK] torch version=2.7.1+cu118 tensile="C:\Program Files\AMD\ROCm\5.7\bin\rocblas\library" cudnn=false sdp=math sdpa=math-only linear=_linear
+[ZLUDA] [OK] ops enabled=none
+[ZLUDA] [INFO] hooks modules=comfy.cli_args,comfy.model_management,comfy.model_detection,comfy.supported_models,comfy.ops,onnxruntime,nodes
+[ZLUDA] [OK] cli_args disable_pinned_memory=true disable_async_offload=true disable_cuda_malloc=true reserve_vram=1.5
+[ZLUDA] [INFO] model_management unet=policy vae=fp16-priority flags=none
+[ZLUDA] [OK] comfy_ops sdpa=math-only int8_fusion=eager
+[ZLUDA] [OK] supported_models memory_usage_factor=patched
+[ZLUDA] [OK] model_detection extra_blocks=loaded
+[ZLUDA] [INFO] gguf_compat status=hooked
+[ZLUDA] [OK] onnxruntime providers=filtered
+[ZLUDA] [OK] gguf_compat status=applied nodes_py=untouched
 ```
 
-`model_management:` also prints one decision line per model load and per VAE load. With both the
+The `model_management` event also prints one decision per model load and per VAE load. With both the
 model and the VAE listing `[bfloat16, float16, float32]` (Anima + Wan):
 
 ```
-[ZLUDA] model_management: unet float16 (policy: model lists fp16; comfy would pick bfloat16)
-[ZLUDA] model_management: vae float16 (policy: fp16 in [bfloat16, float16, float32]; comfy would pick bfloat16)
+[ZLUDA] [INFO] model_management kind=unet dtype=float16 source=policy weights=bfloat16 reason="model lists fp16" comfy_choice=bfloat16
+[ZLUDA] [INFO] model_management kind=vae dtype=float16 source=policy reason="fp16 in [bfloat16, float16, float32]" comfy_choice=bfloat16
 ```
 
 A `[bfloat16, float32]` model instead prints the number pair the decision used, for example
@@ -550,7 +570,7 @@ e.g. `flags=fp16_unet,fp16_text_enc`.
 A manual-cast correction prints its own line, once per model load:
 
 ```
-[ZLUDA] model_management: manual cast float16 (policy: upstream bf16, weights float8_e4m3fn)
+[ZLUDA] [INFO] model_management kind=manual_cast dtype=float16 source=policy reason="upstream bf16" weights=float8_e4m3fn
 ```
 
 `weights unknown` there means the loader did not report a storage dtype (a quantized checkpoint);
@@ -560,39 +580,41 @@ The startup lines and every decision line are appended to `_zluda_status.txt` in
 
 > **Output convention:** status lines are plain English — they are greppable, they survive any
 > console code page, and this document quotes them verbatim. A message that needs a human decision is
-> followed by its own `[ZLUDA] 说明: ...` line in Chinese instead of being appended to the status line.
-> The Chinese line may show up as mojibake in some consoles; the English line is unaffected, and
-> `_zluda_status.txt` is UTF-8 and always the most reliable place to look. Decision lines
-> (`unet ...` / `vae ...`) are records, not warnings, so they never carry a `说明` line.
+> followed by a `[ZLUDA] hint: ...` line in English and then a `[ZLUDA] 说明: ...` line in Chinese,
+> instead of being appended to the status line. The Chinese line may show up as mojibake in some
+> consoles; the English hint is unaffected, and `_zluda_status.txt` is UTF-8 and always the most
+> reliable place to look. Decision lines (`unet ...` / `vae ...`) are records, not warnings, so they
+> never carry a `hint` / `说明` line.
 
-`switches:` is printed first, before any patch work. `ops:` appears immediately after the
-torch line; `hooks:` follows it, before the first `comfy.*` import. `args:` appears when
-`comfy.cli_args` is parsed; `model_management:`, `comfy_ops:` and `supported_models:` during
-startup (and `model_management:` again for every model / VAE load); `model_detection:` when the
-module is patched, and again only if a checkpoint with a different block count is detected;
-`onnxruntime:` only when something imports ONNX Runtime
-(an RMBG / controlnet_aux / Impact node, not at startup). `ops: default` means no optional
-operator fallback is enabled, which is the intended state; on the fallback hook path it is
-printed after `Late torch=` as well (`OPS` is applied there too).
+`[INFO] run pid=` is printed first to separate runs, followed by `[INFO] switches` before
+any patch work. `[OK] ops` appears immediately after the torch event; `[INFO] hooks` follows
+it, before the first `comfy.*` import. `[OK] cli_args` appears when `comfy.cli_args` is parsed;
+`model_management`, `comfy_ops` and `supported_models` during startup (and
+`model_management` again for every model / VAE load); `model_detection` when the module is
+patched, and again only if a checkpoint with a different block count is detected;
+`gguf_compat` after the official GGUF node loads; `onnxruntime` only when something imports
+ONNX Runtime (an RMBG / controlnet_aux / Impact node, not at startup). `[OK] ops enabled=none`
+means no optional operator fallback is enabled, which is the intended state; on the fallback
+hook path it is printed after the `late=true` torch event as well (`OPS` is applied there too).
 
-A healthy torch line is **not** proof that everything worked: the `comfy.ops` half has its
-own `comfy_ops:` line, and it can say `FAILED` while the torch line still says
-`sdpa=math-only`. Always grep the whole status file for `FAILED`.
+A healthy torch event is **not** proof that everything worked: `comfy.ops` has its own
+`comfy_ops` event, and it can be `[FAILED]` while the torch event still says `sdpa=math-only`.
+Always search the whole status file for `[FAILED]`.
 
 If any of the lines below appear, the patch is not fully active (`failed=` lists at most 3 entries).
-Each of them is followed by its own `说明: ...` Chinese line.
+Each of them is followed by a `hint: ...` English line and then a `说明: ...` Chinese line.
 
 | Log line                                                         | Meaning                                                                                                                                                                   | Fix                                                                                                                                                                                                             |
 | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `[ZLUDA] Preload: No ZLUDA dir found (nvcuda.dll not preloaded)` | No folder with the ZLUDA DLLs was found, so `nvcuda.dll` was not preloaded                                                                                                | Let the launcher run ComfyUI once (it unpacks the DLLs into `%TEMP%\<GUID>`), or unpack `.launcher\zluda.<hash>.extpack` into `zluda\` in the package root with 7-Zip                                           |
-| `[ZLUDA] Preload: zluda_dir=... \| loaded=3/5 \| failed=...`     | Some DLLs failed to load                                                                                                                                                  | Look at what `failed=` lists: `xxx.dll:missing` means the file is absent; `WinError 193` usually means a placeholder or HTML file instead of a real DLL                                                         |
-| `[ZLUDA] Direct import failed: ...`                              | The patch raised while importing torch                                                                                                                                    | `Fallback hook installed` should follow; if it does not, even the fallback hook failed to install                                                                                                               |
-| `[ZLUDA] Fallback hook installed`                                | The import hook is installed and will patch torch once it loads                                                                                                           | `Late torch=...` should appear after the next `import torch`                                                                                                                                                    |
-| `[ZLUDA] Late torch=...`                                         | The fallback path patched torch successfully                                                                                                                              | Confirm the line contains `Tensile=`, `cudnn=False`, `sdp=math` and `linear-patch[F.linear=_linear]`                                                                                                            |
-| `sdpa=missing` in the status line                                | This torch has no `F.scaled_dot_product_attention`, so math-only was not wrapped and attention falls back to the crashing FLASH / cuDNN priority list                     | Check the torch version (2.0 or newer is required); this appears inside the `OK torch=` status line, not on its own line                                                                                        |
-| `[ZLUDA] comfy_ops: FAILED ...`                                  | The `comfy.ops` math-only wrapper failed, so attention falls back to the priority list that crashes                                                                       | Check whether another extension imported `comfy.ops` first, or whether this `comfy` has no `scaled_dot_product_attention` at all (too old); the torch line can still say `sdpa=math-only`, so grep for `FAILED` |
-| `[ZLUDA] <key>: FAILED ...`                                      | A module import hook raised, so that module is unpatched. `<key>` is one of `args`, `model_management`, `model_detection`, `supported_models`, `comfy_ops`, `onnxruntime` | Look at the key; a failure outside `comfy_ops` usually only affects that feature                                                                                                                                |
-| `[ZLUDA] Patch FAILED: ...`                                      | The bootstrap block at the top of `main.py` itself raised                                                                                                                 | Check that the block sits before the first line of `main.py` and that `zluda_patch.py` is inside `ComfyUI\`                                                                                                     |
+| `[ZLUDA] [FAILED] preload status=missing`                          | No folder with the ZLUDA DLLs was found, so `nvcuda.dll` was not preloaded                                                                                                | Let the launcher run ComfyUI once (it unpacks the DLLs into `%TEMP%\<GUID>`), or unpack `.launcher\zluda.<hash>.extpack` into `zluda\` in the package root with 7-Zip                                           |
+| `[ZLUDA] [FAILED] preload dir=... dlls=3/5 failed=...`             | Some DLLs failed to load                                                                                                                                                  | Look at what `failed=` lists: `xxx.dll:missing` means the file is absent; `WinError 193` usually means a placeholder or HTML file instead of a real DLL                                                         |
+| `[ZLUDA] [FAILED] torch status=failed stage=direct error=...`      | The patch raised while importing torch                                                                                                                                    | `[WARN] torch status=deferred fallback=true` should follow; if it does not, even the fallback hook failed to install                                                                                            |
+| `[ZLUDA] [WARN] torch status=deferred fallback=true`             | The import hook is installed and will patch torch once it loads                                                                                                           | A `[WARN] torch` line with `late=true` should appear after the next `import torch`                                                                                                                             |
+| `[ZLUDA] [WARN] torch ... late=true`                             | The fallback path patched torch successfully                                                                                                                              | Confirm the line contains `tensile=`, `cudnn=false`, `sdp=math` and `linear=_linear`                                                                                                                            |
+| `sdpa=missing` in the status line                                | This torch has no `F.scaled_dot_product_attention`, so math-only was not wrapped and attention falls back to the crashing FLASH / cuDNN priority list                     | Check the torch version (2.0 or newer is required); this appears inside the `torch` event, not on its own line                                                                                                  |
+| `[ZLUDA] [FAILED] comfy_ops status=missing ...`                    | The `comfy.ops` math-only wrapper failed, so attention falls back to the priority list that crashes                                                                       | Check whether another extension imported `comfy.ops` first, or whether this `comfy` has no `scaled_dot_product_attention` at all (too old); the torch line can still say `sdpa=math-only`, so search for `[FAILED]` |
+| `[ZLUDA] [FAILED] <event> status=failed error=...`                 | A module import hook raised, so that module is unpatched. `<event>` is one of `cli_args`, `model_management`, `model_detection`, `supported_models`, `comfy_ops`, `onnxruntime`, `gguf_compat` | Look at the event; a failure outside `comfy_ops` usually only affects that feature                                                                                                                              |
+| `[ZLUDA] [FAILED] patch_loader ...`                                | The bootstrap block at the top of `main.py` itself raised                                                                                                                 | Check that the block sits before the first line of `main.py` and that `zluda_patch.py` is inside `ComfyUI\`                                                                                                     |
 
 ### 2. One-shot self-check (does not start the UI)
 
@@ -602,12 +624,20 @@ The quickest check is the offline script in this repository. From the package ro
 python zluda_dtype_check.py
 ```
 
-Expected `39 passed, 0 failed`. It loads `ComfyUI\zluda_patch.py` **without** running its bootstrap
-(no DLL preload, no torch, no status file), drives `_apply_model_management()` with a fake
-`comfy.model_management` and a fake torch, and asserts the dtype of every policy branch plus the
-status text it prints: six UNet branches, four VAE branches, the manual-cast correction, both
-switches, the alias, and the fail-open path. Pass another path as the first argument to check a copy
-somewhere else.
+Expected final line: `RESULT: PASS | 59 passed, 0 failed | 全部通过`. It loads `ComfyUI\zluda_patch.py` **without** running its bootstrap
+(no real DLL preload, no torch, no status file) and uses fake modules and a fake torch to assert six UNet
+branches, four VAE branches, the manual-cast correction, both switches, the alias, the fail-open path,
+MiniMax INT8 fallback, ONNX provider tuples, dtype/device-aware dequantization caching, SDP backend
+flags, complete-first ZLUDA directory selection, GGUF runtime compatibility, bilingual hints and
+the structured log format. Pass another path as the first argument to check a copy somewhere else.
+
+To inspect the selected ZLUDA directory, GPU and patch state, run this from the package root:
+
+```bat
+python zluda_env_check.py
+```
+
+Both check scripts live in the package root; the environment script finds the adjacent `ComfyUI` folder automatically.
 
 In the launcher's command prompt, go to the `ComfyUI` folder of the package and run:
 
@@ -646,7 +676,7 @@ Expected `args: True True True 1.5`.
 python -c "import zluda_patch, torch, comfy.model_management as mm; dev = mm.get_torch_device(); print('vae:', mm.vae_dtype(dev, [torch.bfloat16, torch.float32])); print('unet(fp16,bf16,fp32):', mm.unet_dtype(dev, supported_dtypes=[torch.float16, torch.bfloat16, torch.float32]))"
 ```
 
-Expected `vae: torch.bfloat16` and `unet(fp16,bf16,fp32): torch.float16`: the UNet policy prefers fp16 when the model supports it; the VAE check uses `[bf16, fp32]`, so it follows the list and returns bf16 (a VAE that lists fp16 returns fp16). Each call also prints its decision on stderr, e.g. `[ZLUDA] model_management: unet float16 (policy: model lists fp16; comfy would pick bfloat16)`.
+Expected `vae: torch.bfloat16` and `unet(fp16,bf16,fp32): torch.float16`: the UNet policy prefers fp16 when the model supports it; the VAE check uses `[bf16, fp32]`, so it follows the list and returns bf16 (a VAE that lists fp16 returns fp16). Each call also prints its decision on stderr, e.g. `[ZLUDA] [INFO] model_management kind=unet dtype=float16 source=policy reason="model lists fp16" comfy_choice=bfloat16`.
 
 ```bat
 python -c "import zluda_patch, torch, comfy.model_management as mm; dev = mm.get_torch_device(); print('small:', mm.unet_dtype(dev, 100_000_000, supported_dtypes=[torch.bfloat16, torch.float32])); print('large:', mm.unet_dtype(dev, 8_000_000_000, supported_dtypes=[torch.bfloat16, torch.float32]))"
@@ -667,14 +697,93 @@ hook did not run: the first import in the command has to be `zluda_patch`.
 | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `pytorch version:`                                                                         | `2.7.1+cu118`                                                                                                                                                                          |
 | `Total VRAM ...`                                                                           | `16368 MB` on the tested card                                                                                                                                                          |
-| `VAE load device: ..., offload device: ..., dtype:`                                        | `cuda:0` / `cpu` / the VAE dtype. With the VAE row at **Let ComfyUI decide** this follows the VAE list: Flux `[bf16, fp32]` → **bf16**; a VAE that lists fp16 → **fp16**. `float32` means the VAE only allows fp32 or `--fp32-vae` was set. The preceding `[ZLUDA] model_management: vae ...` line names the same dtype and the rule that chose it |
-| `model weight dtype ...`                                                                   | Same dtype as the preceding `[ZLUDA] model_management: unet ...` decision line; that line also says whether the patch policy or ComfyUI's own order decided (`policy:` vs `comfy order:`). A `[bfloat16, float32]` model shows `torch.float32` only when the logged `fp32 ... <= ...` budget check passed |
+| `VAE load device: ..., offload device: ..., dtype:`                                        | `cuda:0` / `cpu` / the VAE dtype. With the VAE row at **Let ComfyUI decide** this follows the VAE list: Flux `[bf16, fp32]` → **bf16**; a VAE that lists fp16 → **fp16**. `float32` means the VAE only allows fp32 or `--fp32-vae` was set. The preceding `[INFO] model_management kind=vae ...` event names the same dtype and the rule that chose it |
+| `model weight dtype ...`                                                                   | Same dtype as the preceding `[INFO] model_management kind=unet ...` event; that event also says whether the patch policy or ComfyUI's own order decided (`source=policy` vs `source=comfy_order`). A `[bfloat16, float32]` model shows `torch.float32` only when the logged `fp32 ... <= ...` budget check passed |
 | `Using ... attention`                                                                      | `split` or `pytorch`, **not** `sub quadratic`                                                                                                                                          |
 | `Enabled pinned memory ...`                                                                | **must not appear**; if it does, the `CLI_ARGS` unit did not run                                                                                                                       |
-| `[ZLUDA] onnxruntime: forcing CPUExecutionProvider`                                        | appears when an ONNX node runs, followed by its own `说明: ...` Chinese line; no `Failed to load ...onnxruntime_providers_cuda.dll` follows                                            |
+| `[ZLUDA] [OK] onnxruntime provider=CPUExecutionProvider ...`                                | appears when an ONNX node runs, followed by an English `hint: ...` line and a Chinese `说明: ...` line; no `Failed to load ...onnxruntime_providers_cuda.dll` follows                  |
 | `Unsupported Pytorch detected. DynamicVRAM support requires Pytorch version 2.8 or later.` | **Normal notice**: ComfyUI falls back to the legacy ModelPatcher; this is not an error                                                                                                 |
 
 > When reading the `VAE load device` line, look at the **first field** only: it is the run device of the VAE, and `cpu` there means "run the VAE on the CPU" is enabled. `offload device: cpu` is the default standby location (it only becomes `cuda:0` with `--gpu-only`) and is unrelated to CPU VAE.
+
+## Output conventions
+
+The common rule is: **Chinese explains, English identifies; technical names, paths, variable names and raw errors are never translated.**
+
+### Patch runtime log
+
+Runtime lines are always `[ZLUDA] [LEVEL] event key=value ...`, where the level is `INFO`, `OK`, `WARN` or `FAILED`. A human-actionable failure emits an English `hint:` line and then a Chinese `说明:` line:
+
+```text
+[ZLUDA] [OK] preload dir=C:\Users\Bosco\AppData\Local\Temp\<GUID> dlls=5/5
+[ZLUDA] [INFO] switches anima_extra_blocks=true reserve_vram=1.5 ...
+[ZLUDA] [INFO] model_management kind=unet dtype=float16 source=policy reason="model lists fp16"
+[ZLUDA] [OK] comfy_ops sdpa=math-only int8_fusion=eager
+```
+
+On failure:
+
+```text
+[ZLUDA] [FAILED] comfy_ops status=missing detail=scaled_dot_product_attention
+[ZLUDA] hint: The comfy.ops module has no scaled_dot_product_attention, so math-only attention was not installed.
+[ZLUDA] 说明: comfy.ops 里没有 scaled_dot_product_attention，math-only 没装上。
+```
+
+### Check scripts
+
+Checks always use `[PASS]`, `[FAILED]`, `[WARN]` or `[SKIP]`:
+
+```text
+[PASS] gguf compat: loader hooked
+[WARN] ZLUDA DLL files
+[FAILED] Torch CUDA availability
+[SKIP] ZLUDA DLL files
+```
+
+The final line is always one of:
+
+```text
+RESULT: PASS | 59 passed, 0 failed | 全部通过
+RESULT: PASS | 9 passed, 0 failed, 0 warnings, 0 skipped | 环境正常
+RESULT: FAIL | 58 passed, 1 failed | 存在失败项
+RESULT: ERROR | patch not found | 找不到补丁文件
+```
+
+`RESULT` values and exit codes:
+
+| Marker | Meaning | Exit code |
+| --- | --- | --- |
+| `PASS` | every check passed | `0` |
+| `WARN` | usable, but there are warnings worth handling | `0` |
+| `FAIL` | a definite failure exists | `1` |
+| `ERROR` | arguments, paths or script setup prevented a check | `2` |
+
+> Per-item failures use `[FAILED]`, which is longer and stands out from the four-letter `[INFO]` / `[WARN]` levels. The final summary keeps `RESULT: FAIL` so the four result states `PASS/WARN/FAIL/ERROR` stay stable.
+
+### Diagnostic headings and encoding
+
+Diagnostic section headings are English first, Chinese second. Bodies keep Chinese explanations and English technical values:
+
+```text
+1. Python and working directory
+   Python 与工作目录
+
+  python      = C:\...\python.exe
+  ComfyUI dir = C:\...\ComfyUI
+```
+
+All check scripts and status files use UTF-8. When a console cannot display Chinese, the English status markers remain readable.
+
+### Capitalization rules
+
+- **Status levels and acronyms keep fixed uppercase spelling:** `[ZLUDA]`, `[INFO]`, `[OK]`, `[WARN]`, `[FAILED]`, `[PASS]`, `[SKIP]`, `RESULT`, `GGUF`, `ONNX`, `SDPA`.
+- **Event and key names are lowercase and underscore-separated:** `preload`, `cli_args`, `gguf_compat`, `int8_fusion=true`.
+- **Boolean values are lowercase:** `true` / `false`, never `True` / `False`.
+- **English hint prose starts with a capital letter and ends with a period:** `hint: SDPA wrapping failed: ...`
+- **English section titles use sentence case:** `Python and working directory`, `Torch and patch status`.
+- **Test IDs are stable identifiers and keep their lowercase start:** `[PASS] unet: model lists fp16`, not `Unet`.
+- **Paths, variable names, function names, enum values and raw errors keep their original casing.**
+- **Chinese has no capitalization rule and is left unchanged.**
 
 ## Troubleshooting
 
@@ -683,8 +792,8 @@ hook did not run: the first import in the command has to be `zluda_patch`.
 | `ValueError: Model "..." is corrupt or invalid... Please download the model again`                            | The file is **missing or the path is wrong**, not corrupt. `comfy/utils.py` (lines 122-146 at the tested commit) reports _any_ exception from `safe_open()`, including FileNotFoundError, as "corrupt"                                                | Check the path and file name; do not re-download blindly                                                                                                                                     |
 | `rocBLAS error: Cannot read .../TensileLibrary.dat ... for GPU arch : gfx906` + `Fatal Python error: Aborted` | `ROCBLAS_TENSILE_LIBPATH` points to a directory without the gfx906 kernels (typically the launcher's `%TEMP%\<GUID>` folder was cleaned or rotated)                                                                                                   | `PRELOAD` points it at the HIP SDK's `bin\rocblas\library`                                                                                                                                   |
 | `CUDA error: CUBLAS_STATUS_NOT_SUPPORTED when calling cublasLtMatmulAlgoGetHeuristic(...)`                    | A linear layer / `addmm` with a bias took the cuBLASLt fused path                                                                                                                                                                                     | `LINEAR`; run the [self-check](#2-one-shot-self-check-does-not-start-the-ui) to confirm `F.linear` is `_linear`                                                                              |
-| `cuDNN error: CUDNN_STATUS_INTERNAL_ERROR`                                                                    | cuDNN is not disabled, **or** the `comfy.ops` attention priority list forces FLASH / cuDNN anyway (`SDPA` unit)                                                                                                                                       | `TORCH`; if it persists, check `sdpa=math-only` in the status line and grep that file for `FAILED`                                                                                           |
-| Black image, no error, log has `unet unexpected: ['blocks.N...']`                                             | The checkpoint has more blocks than the depth ComfyUI builds for it, so the surplus blocks are dropped silently and the latents come out NaN                                                                                                          | `MODEL_DETECTION` counts the blocks in the checkpoint; `model_detection: ... num_blocks 28 -> 40` confirms it. On a ComfyUI without the patch, upgrade it (upstream `725e6ec60`)             |
+| `cuDNN error: CUDNN_STATUS_INTERNAL_ERROR`                                                                    | cuDNN is not disabled, **or** the `comfy.ops` attention priority list forces FLASH / cuDNN anyway (`SDPA` unit)                                                                                                                                       | `TORCH`; if it persists, check `sdpa=math-only` in the torch event and search that file for `[FAILED]`                                                                                         |
+| Black image, no error, log has `unet unexpected: ['blocks.N...']`                                             | The checkpoint has more blocks than the depth ComfyUI builds for it, so the surplus blocks are dropped silently and the latents come out NaN                                                                                                          | `MODEL_DETECTION` counts the blocks in the checkpoint; `[OK] model_detection ... num_blocks_before=28 num_blocks=40` confirms it. On a ComfyUI without the patch, upgrade it (upstream `725e6ec60`) |
 | `RuntimeError: Found no NVIDIA driver on your system`                                                         | The ZLUDA DLLs were **not preloaded before `import torch`** (for example torch was imported manually first, or the launcher's injection failed)                                                                                                       | `PRELOAD`; make sure the startup log shows `loaded=5/5`                                                                                                                                      |
 | `ERROR: clip input is invalid: None`                                                                          | `Load Checkpoint` was used on a model that has **no text encoder** (such as anima-base)                                                                                                                                                               | Use `Load Diffusion Model` + `Load CLIP` + `Load VAE`, or the official template                                                                                                              |
 | Out of VRAM / OOM                                                                                             | A large model on a 16 GB card                                                                                                                                                                                                                         | Lower the resolution, use `--fp8_e4m3fn-unet` or raise `--reserve-vram` (1.5 → 2.5). **Avoid** `--lowvram` / `--novram` if the system has only 16 GB of RAM: swapping will stall the machine |
@@ -692,9 +801,9 @@ hook did not run: the first import in the command has to be `zluda_patch`.
 | Everything is reverted after "Install PyTorch / Install dependencies" in the launcher                         | The launcher reinstalls from its built-in manifest (it pins Python 3.11.6 for the ComfyUI core, and cu118 tops out at 2.3.1 there, which cannot be installed on Python 3.13)                                                                          | Do not click "Install dependencies / Switch Torch version / Reinstall environment" in the launcher                                                                                           |
 | `CUBLAS_STATUS_NOT_SUPPORTED ... abType 3 cType 10 computeType 72`                                            | An `int8_tensorwise` model reached `torch._int_mm` (`LINEAR` unit)                                                                                                                                                                                    | Use a `convrot_w4a4` / `fp8` / `bf16` model, or accept dequantize-per-call                                                                                                                   |
 | Black image, healthy status line, `_math_only` already active                                                 | The VAE row is pinned to Half Precision (FP16) on a VAE that does not list fp16 (Flux), so the decoder overflows to NaN                                                                                                                                | Set the launcher VAE precision row to **Let ComfyUI decide**                                                                                                                                 |
-| `[ZLUDA] model_management: unet ... (comfy order: --fp16-unet)`                                               | A launcher precision row is pinned (the startup line lists it under `flags=`), so the explicit flag wins and the dtype policy is not consulted — by design                                                                                            | Set that launcher row back to **Let ComfyUI decide** if you want the policy to choose                                                                                                        |
-| `[ZLUDA] model_management: unet bfloat16 (policy: fp32 ... > ...)`                                           | A `[bfloat16, float32]` model does not fit fp32 in the weight budget (after `--reserve-vram` and the 10% margin), so the patch keeps bf16 (0.55x fp16 speed) to stay resident                                                                          | Accept bf16, lower `ZLUDA_RESERVE_VRAM`, or force `--fp32-unet` and watch for partial offload; a model that lists fp16 never takes this branch                                               |
-| `onnxruntime` provider errors from RMBG / controlnet_aux / Impact                                             | CUDA 12 `onnxruntime-gpu` provider under ZLUDA (`ONNX` unit)                                                                                                                                                                                          | Confirm the status line says `onnxruntime: CUDA/TensorRT providers filtered`                                                                                                                 |
+| `[ZLUDA] [INFO] model_management kind=unet ... source=comfy_order`                                            | A launcher precision row is pinned (the startup event lists it under `flags=`), so the explicit flag wins and the dtype policy is not consulted — by design                                                                                            | Set that launcher row back to **Let ComfyUI decide** if you want the policy to choose                                                                                                        |
+| `[ZLUDA] [INFO] model_management kind=unet dtype=bfloat16 ... reason="fp32 ... > ..."`                        | A `[bfloat16, float32]` model does not fit fp32 in the weight budget (after `--reserve-vram` and the 10% margin), so the patch keeps bf16 (0.55x fp16 speed) to stay resident                                                                          | Accept bf16, lower `ZLUDA_RESERVE_VRAM`, or force `--fp32-unet` and watch for partial offload; a model that lists fp16 never takes this branch                                               |
+| `onnxruntime` provider errors from RMBG / controlnet_aux / Impact                                             | CUDA 12 `onnxruntime-gpu` provider under ZLUDA (`ONNX` unit)                                                                                                                                                                                          | Confirm the status contains `[OK] onnxruntime providers=filtered`                                                                                                                           |
 
 ### Reverting to the stock torch
 
@@ -768,6 +877,7 @@ switch with its default written next to it, and the state is printed once per la
 | `ZLUDA_VAE_DTYPE=comfy`      | `auto`  | send only the VAE list preference back to ComfyUI's order (status: `vae=comfy-order`)                                                              |
 | `ZLUDA_FP32_MARGIN=<0..1>`   | `0.9`   | safety margin on the fp32 weight budget; lower is stricter, a value outside (0, 1] falls back to 0.9                                               |
 | `ZLUDA_KEEP_ONNX_CUDA=1`     | off     | leave ONNX Runtime's provider list untouched                                                                                                       |
+| `ZLUDA_GGUF_COMPAT=0`        | **on**  | disable runtime interface compatibility for an old official GGUF node                                                                              |
 | `ZLUDA_INT8_DEQUANT_CACHE=1` | off     | cache dequantized INT8 weights (keeps INT8 + adds fp16: ~1.5x fp16 / 3x INT8, 12x faster)                                                          |
 | `ZLUDA_TOPK_CPU=1`           | off     | run `torch.topk` on the CPU                                                                                                                        |
 | `ZLUDA_STFT_CPU=1`           | off     | run `torch.stft` / `torch.istft` on the CPU (audio models)                                                                                         |
@@ -785,6 +895,7 @@ switch with its default written next to it, and the state is printed once per la
 ├── ComfyUI/
 │   └── zluda_patch.py         # the compatibility patch (copy to ComfyUI\ in the package root)
 ├── zluda_dtype_check.py       # offline self-check for the dtype policy (copy to the package root)
+├── zluda_env_check.py         # ZLUDA, GPU and patch diagnostic (copy to the package root)
 ├── LICENSE
 ├── README.md
 └── README.zh-CN.md
